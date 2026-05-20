@@ -864,8 +864,26 @@ def initial_page(
     driver.get(fast_forward_url2)
     time.sleep(5)
     resp_text = body_text(driver)
+
+    # PAI: detect rate limiting and back off aggressively
+    if "Too Many Requests" in resp_text or "429" in driver.title:
+        wait_min = random.randint(10, 20)
+        logging.warning(f"429 Rate Limited — sleeping {wait_min} minutes before retry")
+        _ntfy("Rate limited (429)", f"ICP+ returned 429. Backing off {wait_min} min.", priority="low", tags="hourglass")
+        time.sleep(wait_min * 60)
+        context.first_load = True
+        raise TimeoutException
+
+    # PAI: detect WAF block
+    if "Request Rejected" in resp_text or "requested URL was rejected" in resp_text:
+        wait_min = random.randint(20, 40)
+        logging.warning(f"WAF blocked — sleeping {wait_min} minutes before retry")
+        _ntfy("WAF blocked", f"ICP+ rejected request. Backing off {wait_min} min.", priority="low", tags="no_entry")
+        time.sleep(wait_min * 60)
+        context.first_load = True
+        raise TimeoutException
+
     if "INTERNET CITA PREVIA" not in resp_text:
-        # PAI: diagnostic logging — what does the page actually say?
         logging.error(f"Expected 'INTERNET CITA PREVIA' not found. Page title: {driver.title}")
         logging.error(f"Current URL: {driver.current_url}")
         logging.error(f"Body text (first 500 chars): {resp_text[:500]}")
