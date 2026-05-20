@@ -865,6 +865,12 @@ def initial_page(
     time.sleep(5)
     resp_text = body_text(driver)
     if "INTERNET CITA PREVIA" not in resp_text:
+        # PAI: diagnostic logging — what does the page actually say?
+        logging.error(f"Expected 'INTERNET CITA PREVIA' not found. Page title: {driver.title}")
+        logging.error(f"Current URL: {driver.current_url}")
+        logging.error(f"Body text (first 500 chars): {resp_text[:500]}")
+        if context.save_artifacts:
+            driver.save_screenshot(f"/app/data/initial-fail-{dt.now()}.png".replace(":", "-"))
         context.first_load = True
         raise TimeoutException
     context.first_load = False
