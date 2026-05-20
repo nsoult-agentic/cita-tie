@@ -9,8 +9,10 @@ import os
 import pathlib
 import random
 import sys
+import threading
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from bcncita import CustomerProfile, DocType, Office, OperationType, Province, try_cita
 
@@ -22,6 +24,45 @@ logging.basicConfig(
 log = logging.getLogger("scheduler")
 
 SECRETS_DIR = os.environ.get("SECRETS_DIR", "/secrets")
+HEARTBEAT_INTERVAL = 6 * 3600  # 6 hours
+
+# ── Stats tracker ───────────────────────────────────────────────────
+
+_stats = {
+    "start_time": None,
+    "total_runs": 0,
+    "total_attempts": 0,
+    "rate_limits": 0,
+    "page_loads": 0,
+    "errors": 0,
+    "last_attempt": None,
+    "last_state": "starting",
+    "booked": False,
+}
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        stats = {**_stats}
+        stats["uptime_hours"] = round((time.time() - stats["start_time"]) / 3600, 1) if stats["start_time"] else 0
+        stats["start_time"] = str(datetime.fromtimestamp(stats["start_time"])) if stats["start_time"] else None
+        self.wfile.write(json.dumps(stats, indent=2).encode())
+
+    def log_message(self, *args):
+        pass
+
+
+def _start_health_server(port=8080):
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    import socket
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    log.info(f"Health endpoint running on :{port}/")
+
 
 # Community-observed release windows (Europe/Madrid local time)
 # Format: (start_hour, start_min, end_hour, end_min)
@@ -186,9 +227,22 @@ def cleanup_old_screenshots(data_dir="/app/data", max_age_days=7):
             pass
 
 
+def _heartbeat_summary():
+    """Build a short stats summary for ntfy."""
+    up_h = round((time.time() - _stats["start_time"]) / 3600, 1) if _stats["start_time"] else 0
+    return (
+        f"Uptime: {up_h}h | Runs: {_stats['total_runs']} | "
+        f"Attempts: {_stats['total_attempts']} | "
+        f"Rate limits: {_stats['rate_limits']} | Errors: {_stats['errors']} | "
+        f"State: {_stats['last_state']}"
+    )
+
+
 def main():
     profile, ntfy_config = build_profile()
 
+    _stats["start_time"] = time.time()
+    _start_health_server(port=int(os.environ.get("SMS_CODE_PORT", "8080")))
     cleanup_old_screenshots()
 
     _ntfy(
@@ -199,29 +253,41 @@ def main():
         tags="mag,robot_face",
     )
 
-    run_count = 0
+    last_heartbeat = time.time()
+
     while True:
         hot = is_hot_window()
         cycles = HOT_CYCLES if hot else COLD_CYCLES
         sleep_time = HOT_SLEEP if hot else COLD_SLEEP
         window_type = "HOT" if hot else "COLD"
 
-        run_count += 1
-        log.info(f"=== Run #{run_count} | {window_type} window | {cycles} cycles ===")
+        _stats["total_runs"] += 1
+        _stats["total_attempts"] += cycles
+        _stats["last_state"] = f"{window_type} polling"
+        log.info(f"=== Run #{_stats['total_runs']} | {window_type} window | {cycles} cycles ===")
 
         try:
             success = try_cita(context=profile, cycles=cycles)
         except KeyboardInterrupt:
             log.info("Interrupted by user")
-            _ntfy("TIE Checker Stopped", "Manually interrupted", ntfy_config, tags="stop_sign")
+            _ntfy("TIE Checker Stopped", _heartbeat_summary(), ntfy_config, tags="stop_sign")
             break
         except Exception as e:
-            log.error(f"Unexpected error: {e}")
+            msg = str(e).split("\n")[0] if str(e) else type(e).__name__
+            log.error(f"Unexpected error: {msg}")
+            _stats["errors"] += 1
             success = False
 
         if success:
+            _stats["booked"] = True
+            _stats["last_state"] = "BOOKED"
             log.info("APPOINTMENT BOOKED! Exiting.")
             break
+
+        # Periodic heartbeat
+        if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
+            _ntfy("TIE Checker Status", _heartbeat_summary(), ntfy_config, priority="low", tags="chart_with_upwards_trend")
+            last_heartbeat = time.time()
 
         # Reset solver state for next run (new browser session)
         profile.capmonster_client = None

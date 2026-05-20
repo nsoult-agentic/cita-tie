@@ -756,7 +756,12 @@ def office_selection(driver: webdriver, context: CustomerProfile):
                 continue
             btn = find_element_resilient(driver, BTN_SIGUIENTE)
             if btn:
-                btn.send_keys(Keys.ENTER)
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+                    time.sleep(0.3)
+                    btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", btn)
             return True
         elif page_state == PageState.NO_APPOINTMENTS:
             logging.info("No appointments available — retrying...")
@@ -798,7 +803,12 @@ def confirm_appointment(driver: webdriver, context: CustomerProfile):
         chk_email.send_keys(Keys.SPACE)
     btn = find_element_resilient(driver, BTN_CONFIRMAR)
     if btn:
-        btn.send_keys(Keys.ENTER)
+        try:
+            driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+            time.sleep(0.3)
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
     resp_text = body_text(driver)
     ctime = dt.now()
 
@@ -937,17 +947,30 @@ def cycle_cita(
         logging.info("Instructions page loaded")
         return True
 
-    btn.send_keys(Keys.ENTER)
+    # Wait for clickable, scroll into view, then click
+    try:
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, btn.get_attribute("id") or "btnEntrar")))
+        driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+        time.sleep(0.3)
+        btn.click()
+    except Exception:
+        # Fallback: JS click bypasses overlay/visibility issues
+        driver.execute_script("arguments[0].click();", btn)
     logging.info("[Step 1/6] Personal info")
 
     success = fill_personal_info(driver, context)
     if not success:
         return None
 
-    time.sleep(2)
+    time.sleep(0.5)
     enviar_btn = find_element_resilient(driver, BTN_ENVIAR)
     if enviar_btn:
-        enviar_btn.send_keys(Keys.ENTER)
+        try:
+            driver.execute_script("arguments[0].scrollIntoView(true);", enviar_btn)
+            time.sleep(0.3)
+            enviar_btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", enviar_btn)
     else:
         logging.error("Could not find enviar button")
         return None
