@@ -865,21 +865,19 @@ def initial_page(
     time.sleep(5)
     resp_text = body_text(driver)
 
-    # PAI: detect rate limiting and back off aggressively
+    # PAI: detect rate limiting — short backoff, these clear quickly
     if "Too Many Requests" in resp_text or "429" in driver.title:
-        wait_min = random.randint(10, 20)
-        logging.warning(f"429 Rate Limited — sleeping {wait_min} minutes before retry")
-        _ntfy("Rate limited (429)", f"ICP+ returned 429. Backing off {wait_min} min.", priority="low", tags="hourglass")
-        time.sleep(wait_min * 60)
+        wait_sec = random.randint(120, 300)
+        logging.warning(f"429 Rate Limited — sleeping {wait_sec}s before retry")
+        time.sleep(wait_sec)
         context.first_load = True
         raise TimeoutException
 
     # PAI: detect WAF block
     if "Request Rejected" in resp_text or "requested URL was rejected" in resp_text:
-        wait_min = random.randint(20, 40)
-        logging.warning(f"WAF blocked — sleeping {wait_min} minutes before retry")
-        _ntfy("WAF blocked", f"ICP+ rejected request. Backing off {wait_min} min.", priority="low", tags="no_entry")
-        time.sleep(wait_min * 60)
+        wait_sec = random.randint(300, 600)
+        logging.warning(f"WAF blocked — sleeping {wait_sec}s before retry")
+        time.sleep(wait_sec)
         context.first_load = True
         raise TimeoutException
 
