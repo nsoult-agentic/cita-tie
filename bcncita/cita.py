@@ -893,8 +893,8 @@ def initial_page(
         context.first_load = True
         raise TimeoutException
 
-    if "INTERNET CITA PREVIA" not in resp_text:
-        logging.error(f"Expected 'INTERNET CITA PREVIA' not found. Page title: {driver.title}")
+    if "CITA PREVIA" not in resp_text:
+        logging.error(f"Expected 'CITA PREVIA' not found. Page title: {driver.title}")
         logging.error(f"Current URL: {driver.current_url}")
         logging.error(f"Body text (first 500 chars): {resp_text[:500]}")
         if context.save_artifacts:
