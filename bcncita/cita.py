@@ -854,15 +854,27 @@ def initial_page(
     driver.set_page_load_timeout(300 if context.first_load else 50)
     time.sleep(1)
     driver.get(fast_forward_url)
-    time.sleep(5)
+    time.sleep(random.randint(3, 7))  # PAI: randomize wait to look more human
+
+    # PAI: check first page before proceeding
+    first_text = body_text(driver)
+    if "Too Many Requests" in first_text or "Request Rejected" in first_text:
+        wait_sec = random.randint(120, 300)
+        logging.warning(f"First page blocked ({driver.title}) — sleeping {wait_sec}s")
+        time.sleep(wait_sec)
+        context.first_load = True
+        raise TimeoutException
+
     if context.first_load:
         try:
             driver.execute_script("window.localStorage.clear();")
             driver.execute_script("window.sessionStorage.clear();")
         except Exception as e:
             logging.error(e)
+
+    time.sleep(random.randint(2, 5))  # PAI: pause between navigations
     driver.get(fast_forward_url2)
-    time.sleep(5)
+    time.sleep(random.randint(3, 7))
     resp_text = body_text(driver)
 
     # PAI: detect rate limiting — short backoff, these clear quickly
