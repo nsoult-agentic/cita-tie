@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bcncita/ ./bcncita/
 COPY run.py .
 
-RUN useradd -r -s /bin/false cita && \
+RUN useradd -r -m -d /home/cita -s /bin/false cita && \
     mkdir -p /app/data && chown cita:cita /app/data
 
 USER cita
