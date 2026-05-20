@@ -32,7 +32,6 @@ from capmonstercloudclient import CapMonsterClient, ClientOptions
 from capmonstercloudclient.requests import RecaptchaV3ProxylessRequest, ImageToTextRequest
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.chrome.service import Service  # PAI: modern Selenium API
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -290,9 +289,6 @@ class CustomerProfile:
     capmonster_api_key: Optional[str] = None  # PAI: CapMonster Cloud API key
     auto_captcha: bool = True
     auto_office: bool = True
-    chrome_driver_path: str = "/usr/bin/chromedriver"  # PAI: Debian path
-    chrome_profile_name: Optional[str] = None
-    chrome_profile_path: Optional[str] = None
     min_date: Optional[str] = None
     max_date: Optional[str] = None
     min_time: Optional[str] = None
@@ -314,48 +310,36 @@ class CustomerProfile:
 
 
 def init_wedriver(context: CustomerProfile):
-    options = webdriver.ChromeOptions()
-    if context.chrome_profile_path:
-        options.add_argument(f"user-data-dir={context.chrome_profile_path}")
-    if context.chrome_profile_name:
-        options.add_argument(f"profile-directory={context.chrome_profile_name}")
+    """Initialize headless Firefox — less detectable than Chrome for government sites."""
+    options = webdriver.FirefoxOptions()
 
-    # PAI: headless mode for Docker
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--lang=es-ES,es")
-    options.add_argument("--window-size=1920,1080")
+    # Headless mode
+    options.add_argument("--headless")
+    options.add_argument("--width=1920")
+    options.add_argument("--height=1080")
 
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    settings = {
-        "recentDestinations": [{"id": "Save as PDF"}],
-        "selectedDestinationId": "Save as PDF",
-        "version": 2,
-    }
-    prefs = {
-        "printing.print_preview_sticky_settings.appState": json.dumps(settings),
-        "download.default_directory": "/app/data",
-    }
-    options.add_experimental_option("prefs", prefs)
-    options.add_argument("--kiosk-printing")
+    # Anti-detection: disable navigator.webdriver
+    options.set_preference("dom.webdriver.enabled", False)
+    options.set_preference("useAutomationExtension", False)
 
-    # PAI: modern Selenium API with Service
-    service = Service(executable_path=context.chrome_driver_path)
-    browser = webdriver.Chrome(service=service, options=options)
-    browser.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-        "source": """
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'languages', {get: () => ['es-ES', 'es', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            window.chrome = {runtime: {}};
-        """
-    })
-    version_info = browser.capabilities.get('browserVersion', '120.0.0.0')
-    ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version_info} Safari/537.36"
-    browser.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": ua})
+    # Language preferences — Spanish
+    options.set_preference("intl.accept_languages", "es-ES,es,en")
+    options.set_preference("general.useragent.locale", "es-ES")
+
+    # Download directory
+    options.set_preference("browser.download.dir", "/app/data")
+    options.set_preference("browser.download.folderList", 2)
+
+    # Disable telemetry/update checks
+    options.set_preference("toolkit.telemetry.enabled", False)
+    options.set_preference("app.update.enabled", False)
+    options.set_preference("browser.shell.checkDefaultBrowser", False)
+
+    browser = webdriver.Firefox(options=options)
+
+    # Additional navigator.webdriver removal
+    browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
     return browser
 
 
