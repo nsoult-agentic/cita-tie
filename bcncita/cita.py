@@ -2,6 +2,7 @@
 Vendored from https://github.com/cita-bot/cita-bot (AGPL-3.0)
 Modified for PAI: headless Docker, ntfy notifications, no os._exit, SMS HTTP endpoint.
 All PAI modifications marked with # PAI: comments.
+Resilience layer: selectors.py + resilience.py for fallback strategies and page state detection.
 """
 import io
 import json
@@ -38,6 +39,18 @@ from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support.wait import WebDriverWait
 
 from .speaker import new_speaker
+from .resilience import (
+    find_element_resilient,
+    find_elements_resilient,
+    detect_page_state,
+    submit_form_resilient,
+    PageState,
+    StepError,
+    step_runner,
+    get_fallback_report,
+    reset_fallback_tracking,
+)
+from .selectors import *
 
 __all__ = [
     "try_cita",
@@ -404,6 +417,13 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
         logging.error("FAIL - all cycles exhausted")
         # PAI: no ntfy here — the scheduler in run.py handles retry notifications
 
+    # PAI: fallback report after cycle loop
+    report = get_fallback_report()
+    if report:
+        logging.warning(f"Session fallback report:\n{report}")
+        _ntfy("Fallback selectors used", report, priority="low", tags="mag")
+    reset_fallback_tracking()
+
     # PAI: always quit driver, never os._exit
     try:
         driver.quit()
@@ -413,153 +433,75 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
     return success
 
 
-def toma_huellas_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "txtPaisNac"))
-        )
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-    select = Select(driver.find_element(By.ID, "txtPaisNac"))
-    select.select_by_visible_text(context.country)
+# ── Operations that need country select ────────────────────────────
+_OPS_NEED_COUNTRY = {
+    OperationType.TOMA_HUELLAS,
+    OperationType.SOLICITUD_ASILO,
+    OperationType.ASIGNACION_NIE,
+}
+
+# ── Operations that need year_of_birth ─────────────────────────────
+_OPS_NEED_YEAR_OF_BIRTH = {
+    OperationType.SOLICITUD_ASILO,
+    OperationType.ASIGNACION_NIE,
+}
+
+
+def fill_personal_info(driver: webdriver, context: CustomerProfile):
+    """Unified personal info form — replaces 8 duplicated step2 functions."""
+    needs_country = context.operation_code in _OPS_NEED_COUNTRY
+    needs_year = context.operation_code in _OPS_NEED_YEAR_OF_BIRTH
+
+    # For TOMA_HUELLAS: country select appears first, wait on it
+    if context.operation_code == OperationType.TOMA_HUELLAS:
+        el = find_element_resilient(driver, COUNTRY_SELECT, timeout=DELAY)
+        if not el:
+            logging.error("Timed out waiting for form to load")
+            return None
+        select = Select(el)
+        select.select_by_visible_text(context.country)
+    else:
+        # All other ops: wait for the doc number input to appear
+        el = find_element_resilient(driver, DOC_NUMBER_INPUT, timeout=DELAY)
+        if not el:
+            logging.error("Timed out waiting for form to load")
+            return None
+
+    # Select document type radio button
     if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
+        radio = find_element_resilient(driver, DOC_TYPE_PASSPORT)
+        if radio:
+            radio.send_keys(Keys.SPACE)
     elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-    return True
-
-
-def recogida_de_tarjeta_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "txtIdCitado"))
-        )
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-    return True
-
-
-def solicitud_asilo_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "txtIdCitado"))
-        )
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(
-        context.doc_value, Keys.TAB, context.name, Keys.TAB, context.year_of_birth
-    )
-    select = Select(driver.find_element(By.ID, "txtPaisNac"))
-    select.select_by_visible_text(context.country)
-    return True
-
-
-def brexit_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "txtIdCitado"))
-        )
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-    return True
-
-
-def carta_invitacion_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "txtIdCitado"))
-        )
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
+        radio = find_element_resilient(driver, DOC_TYPE_NIE)
+        if radio:
+            radio.send_keys(Keys.SPACE)
     elif context.doc_type == DocType.DNI:
-        driver.find_element(By.ID, "rdbTipoDocDni").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-    return True
+        # Only carta_invitacion and certificados support DNI in the original
+        radio = find_element_resilient(driver, DOC_TYPE_DNI)
+        if radio:
+            radio.send_keys(Keys.SPACE)
 
-
-def certificados_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "txtIdCitado"))
-        )
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
+    # Fill in doc number + name (+ year_of_birth if needed)
+    element = find_element_resilient(driver, DOC_NUMBER_INPUT)
+    if not element:
+        logging.error("Could not find document number input")
         return None
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.DNI:
-        driver.find_element(By.ID, "rdbTipoDocDni").send_keys(Keys.SPACE)
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-    return True
 
-
-def autorizacion_de_regreso_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "txtIdCitado"))
+    if needs_year and context.year_of_birth:
+        element.send_keys(
+            context.doc_value, Keys.TAB, context.name, Keys.TAB, context.year_of_birth
         )
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-    if context.doc_type == DocType.PASSPORT:
-        driver.find_element(By.ID, "rdbTipoDocPas").send_keys(Keys.SPACE)
-    elif context.doc_type == DocType.NIE:
-        driver.find_element(By.ID, "rdbTipoDocNie").send_keys(Keys.SPACE)
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(context.doc_value, Keys.TAB, context.name)
-    return True
+    else:
+        element.send_keys(context.doc_value, Keys.TAB, context.name)
 
+    # Country select for ops that need it AFTER doc fields (SOLICITUD_ASILO, ASIGNACION_NIE)
+    if needs_country and context.operation_code != OperationType.TOMA_HUELLAS:
+        country_el = find_element_resilient(driver, COUNTRY_SELECT)
+        if country_el:
+            select = Select(country_el)
+            select.select_by_visible_text(context.country)
 
-def asignacion_nie_step2(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "txtIdCitado"))
-        )
-    except TimeoutException:
-        logging.error("Timed out waiting for form to load")
-        return None
-    if context.doc_type == DocType.PASSPORT:
-        option = driver.find_element(By.ID, "rdbTipoDocPas")
-        if option:
-            option.send_keys(Keys.SPACE)
-    element = driver.find_element(By.ID, "txtIdCitado")
-    element.send_keys(
-        context.doc_value, Keys.TAB, context.name, Keys.TAB, context.year_of_birth
-    )
-    select = Select(driver.find_element(By.ID, "txtPaisNac"))
-    select.select_by_visible_text(context.country)
     return True
 
 
@@ -586,9 +528,11 @@ def process_captcha(driver: webdriver, context: CustomerProfile):
         if not context.capmonster_api_key:
             logging.error("CapMonster API key is empty")
             return None
-        if len(driver.find_elements(By.ID, "reCAPTCHA_site_key")) > 0:
+        recaptcha_key = find_element_resilient(driver, RECAPTCHA_SITE_KEY, timeout=2)
+        captcha_imgs = find_elements_resilient(driver, CAPTCHA_IMAGE, timeout=2)
+        if recaptcha_key:
             captcha_result = solve_recaptcha(driver, context)
-        elif len(driver.find_elements(By.CSS_SELECTOR, "img.img-thumbnail")) > 0:
+        elif captcha_imgs:
             captcha_result = solve_image_captcha(driver, context)
         else:
             captcha_result = True
@@ -617,8 +561,13 @@ def _get_capmonster_client(context: CustomerProfile) -> CapMonsterClient:
 
 
 def solve_recaptcha(driver: webdriver, context: CustomerProfile):
-    site_key = driver.find_element(By.ID, "reCAPTCHA_site_key").get_attribute("value")
-    page_action = driver.find_element(By.ID, "action").get_attribute("value")
+    site_key_el = find_element_resilient(driver, RECAPTCHA_SITE_KEY)
+    action_el = find_element_resilient(driver, RECAPTCHA_ACTION)
+    if not site_key_el or not action_el:
+        logging.error("Could not find reCAPTCHA elements")
+        return None
+    site_key = site_key_el.get_attribute("value")
+    page_action = action_el.get_attribute("value")
     logging.info(f"CapMonster: reCAPTCHA v3 — site_key={site_key}, action={page_action}")
 
     client = _get_capmonster_client(context)
@@ -636,9 +585,16 @@ def solve_recaptcha(driver: webdriver, context: CustomerProfile):
         g_response = responses.get("gRecaptchaResponse", "")
         if g_response:
             logging.info(f"CapMonster: solved reCAPTCHA v3 ({len(g_response)} chars)")
-            driver.execute_script(
-                f"document.getElementById('g-recaptcha-response').value = '{g_response}'"
-            )
+            recaptcha_resp = find_element_resilient(driver, RECAPTCHA_RESPONSE, timeout=2)
+            if recaptcha_resp:
+                driver.execute_script(
+                    f"arguments[0].value = '{g_response}'", recaptcha_resp
+                )
+            else:
+                # Fallback to direct ID approach
+                driver.execute_script(
+                    f"document.getElementById('g-recaptcha-response').value = '{g_response}'"
+                )
             return True
         else:
             logging.error(f"CapMonster: empty response — {responses}")
@@ -652,7 +608,11 @@ def solve_image_captcha(driver: webdriver, context: CustomerProfile):
     context.current_solver = "image_to_text"
 
     try:
-        img = driver.find_elements(By.CSS_SELECTOR, "img.img-thumbnail")[0]
+        imgs = find_elements_resilient(driver, CAPTCHA_IMAGE)
+        if not imgs:
+            logging.error("No captcha images found")
+            return None
+        img = imgs[0]
         img_data = img.get_attribute("src").split(",")[1].strip()
         logging.info("CapMonster: solving image CAPTCHA...")
 
@@ -663,8 +623,12 @@ def solve_image_captcha(driver: webdriver, context: CustomerProfile):
         captcha_text = responses.get("text", "")
         if captcha_text:
             logging.info(f"CapMonster: image CAPTCHA text: {captcha_text}")
-            element = driver.find_element(By.ID, "captcha")
-            element.send_keys(captcha_text)
+            element = find_element_resilient(driver, CAPTCHA_TEXT_INPUT)
+            if element:
+                element.send_keys(captcha_text)
+            else:
+                logging.error("Could not find captcha text input")
+                return None
             return True
         else:
             logging.error(f"CapMonster: empty image response — {responses}")
@@ -676,7 +640,7 @@ def solve_image_captcha(driver: webdriver, context: CustomerProfile):
 
 def find_best_date_slots(driver: webdriver, context: CustomerProfile):
     try:
-        els = driver.find_elements(By.CSS_SELECTOR, "[id^=lCita_]")
+        els = find_elements_resilient(driver, SLOT_DATES)
         dates = sorted([*map(lambda x: x.text, els)])
         best_date = find_best_date(dates, context)
         if best_date:
@@ -715,7 +679,10 @@ def select_office(driver: webdriver, context: CustomerProfile):
         logging.info("auto_office disabled — skipping office selection")
         return None  # PAI: can't do input() in Docker
     else:
-        el = driver.find_element(By.ID, "idSede")
+        el = find_element_resilient(driver, OFFICE_SELECT)
+        if not el:
+            logging.error("Could not find office select element")
+            return None
         select = Select(el)
         if context.save_artifacts:
             offices_path = os.path.join(
@@ -746,17 +713,16 @@ def select_office(driver: webdriver, context: CustomerProfile):
 
 
 def office_selection(driver: webdriver, context: CustomerProfile):
-    driver.execute_script("enviar('solicitud');")
+    submit_form_resilient(driver, "enviar('solicitud');", BTN_ENVIAR)
     for i in range(REFRESH_PAGE_CYCLES):
         resp_text = body_text(driver)
-        if "Seleccione la oficina donde solicitar la cita" in resp_text:
+        page_state = detect_page_state(driver, resp_text)
+
+        if page_state == PageState.OFFICE_SELECTION:
             logging.info("[Step 2/6] Office selection")
             time.sleep(0.3)
-            try:
-                WebDriverWait(driver, DELAY).until(
-                    EC.presence_of_element_located((By.ID, "btnSiguiente"))
-                )
-            except TimeoutException:
+            btn = find_element_resilient(driver, BTN_SIGUIENTE, timeout=DELAY)
+            if not btn:
                 logging.error("Timed out waiting for offices to load")
                 return None
             res = select_office(driver, context)
@@ -764,10 +730,11 @@ def office_selection(driver: webdriver, context: CustomerProfile):
                 time.sleep(5)
                 driver.refresh()
                 continue
-            btn = driver.find_element(By.ID, "btnSiguiente")
-            btn.send_keys(Keys.ENTER)
+            btn = find_element_resilient(driver, BTN_SIGUIENTE)
+            if btn:
+                btn.send_keys(Keys.ENTER)
             return True
-        elif "En este momento no hay citas disponibles" in resp_text:
+        elif page_state == PageState.NO_APPOINTMENTS:
             logging.info("No appointments available — retrying...")
             time.sleep(5)
             driver.refresh()
@@ -778,38 +745,45 @@ def office_selection(driver: webdriver, context: CustomerProfile):
 
 
 def phone_mail(driver: webdriver, context: CustomerProfile):
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "txtTelefonoCitado"))
-        )
-        logging.info("[Step 3/6] Contact info")
-    except TimeoutException:
+    element = find_element_resilient(driver, PHONE_INPUT, timeout=DELAY)
+    if not element:
         logging.error("Timed out waiting for contact info page to load")
         return None
-    element = driver.find_element(By.ID, "txtTelefonoCitado")
+    logging.info("[Step 3/6] Contact info")
     element.send_keys(context.phone)
     try:
-        element = driver.find_element(By.ID, "emailUNO")
-        element.send_keys(context.email)
-        element = driver.find_element(By.ID, "emailDOS")
-        element.send_keys(context.email)
+        email_one = find_element_resilient(driver, EMAIL_ONE)
+        if email_one:
+            email_one.send_keys(context.email)
+        email_two = find_element_resilient(driver, EMAIL_TWO)
+        if email_two:
+            email_two.send_keys(context.email)
     except Exception:
         pass
     add_reason(driver, context)
-    driver.execute_script("enviar();")
+    submit_form_resilient(driver, "enviar();", BTN_ENVIAR)
     return cita_selection(driver, context)
 
 
 def confirm_appointment(driver: webdriver, context: CustomerProfile):
-    driver.find_element(By.ID, "chkTotal").send_keys(Keys.SPACE)
-    driver.find_element(By.ID, "enviarCorreo").send_keys(Keys.SPACE)
-    btn = driver.find_element(By.ID, "btnConfirmar")
-    btn.send_keys(Keys.ENTER)
+    chk = find_element_resilient(driver, CHK_TOTAL)
+    if chk:
+        chk.send_keys(Keys.SPACE)
+    chk_email = find_element_resilient(driver, CHK_EMAIL)
+    if chk_email:
+        chk_email.send_keys(Keys.SPACE)
+    btn = find_element_resilient(driver, BTN_CONFIRMAR)
+    if btn:
+        btn.send_keys(Keys.ENTER)
     resp_text = body_text(driver)
     ctime = dt.now()
-    if "CITA CONFIRMADA Y GRABADA" in resp_text:
+
+    page_state = detect_page_state(driver, resp_text)
+
+    if page_state == PageState.SUCCESS:
         context.bot_result = True
-        code = driver.find_element(By.ID, "justificanteFinal").text
+        code_el = find_element_resilient(driver, JUSTIFICANTE)
+        code = code_el.text if code_el else "UNKNOWN"
         logging.info(f"[Step 6/6] Justificante cita: {code}")
         # PAI: save screenshot and notify
         if context.save_artifacts:
@@ -822,7 +796,7 @@ def confirm_appointment(driver: webdriver, context: CustomerProfile):
             tags="white_check_mark,tada",
         )
         return True
-    elif "Lo sentimos, el código introducido no es correcto" in resp_text:
+    elif page_state == PageState.SMS_CODE_WRONG:
         logging.error("Incorrect code entered")
         _ntfy("SMS code incorrect", "The SMS code was wrong. Will retry.", priority="high", tags="x")
     else:
@@ -856,9 +830,9 @@ def initial_page(
     driver.get(fast_forward_url)
     time.sleep(random.randint(3, 7))  # PAI: randomize wait to look more human
 
-    # PAI: check first page before proceeding
-    first_text = body_text(driver)
-    if "Too Many Requests" in first_text or "Request Rejected" in first_text:
+    # PAI: check first page for rate limiting using detect_page_state
+    page_state = detect_page_state(driver)
+    if page_state == PageState.RATE_LIMITED:
         wait_sec = random.randint(120, 300)
         logging.warning(f"First page blocked ({driver.title}) — sleeping {wait_sec}s")
         time.sleep(wait_sec)
@@ -875,24 +849,34 @@ def initial_page(
     time.sleep(random.randint(2, 5))  # PAI: pause between navigations
     driver.get(fast_forward_url2)
     time.sleep(random.randint(3, 7))
-    resp_text = body_text(driver)
 
-    # PAI: detect rate limiting — short backoff, these clear quickly
-    if "Too Many Requests" in resp_text or "429" in driver.title:
+    # PAI: detect page state after second navigation
+    page_state = detect_page_state(driver)
+
+    if page_state == PageState.RATE_LIMITED:
         wait_sec = random.randint(120, 300)
         logging.warning(f"429 Rate Limited — sleeping {wait_sec}s before retry")
         time.sleep(wait_sec)
         context.first_load = True
         raise TimeoutException
 
-    # PAI: detect WAF block
-    if "Request Rejected" in resp_text or "requested URL was rejected" in resp_text:
-        wait_sec = random.randint(300, 600)
-        logging.warning(f"WAF blocked — sleeping {wait_sec}s before retry")
-        time.sleep(wait_sec)
+    if page_state == PageState.ERROR:
+        logging.error(f"System error detected. Page title: {driver.title}")
+        logging.error(f"Current URL: {driver.current_url}")
+        if context.save_artifacts:
+            driver.save_screenshot(f"/app/data/initial-fail-{dt.now()}.png".replace(":", "-"))
         context.first_load = True
         raise TimeoutException
 
+    # Accept INITIAL_LANDING or any non-blocked state as success
+    if page_state in (PageState.INITIAL_LANDING, PageState.INSTRUCTIONS,
+                      PageState.PERSONAL_INFO, PageState.OFFICE_SELECTION,
+                      PageState.UNKNOWN):
+        context.first_load = False
+        return
+
+    # Fallback: verify body text contains expected content
+    resp_text = body_text(driver)
     if "CITA PREVIA" not in resp_text:
         logging.error(f"Expected 'CITA PREVIA' not found. Page title: {driver.title}")
         logging.error(f"Current URL: {driver.current_url}")
@@ -908,11 +892,9 @@ def cycle_cita(
     driver: webdriver, context: CustomerProfile, fast_forward_url, fast_forward_url2
 ):
     initial_page(driver, context, fast_forward_url, fast_forward_url2)
-    try:
-        WebDriverWait(driver, DELAY).until(
-            EC.presence_of_element_located((By.ID, "btnEntrar"))
-        )
-    except TimeoutException:
+
+    btn = find_element_resilient(driver, BTN_ENTRAR, timeout=DELAY)
+    if not btn:
         logging.error("Timed out waiting for Instructions page to load")
         return None
 
@@ -920,43 +902,23 @@ def cycle_cita(
         logging.info("Instructions page loaded")
         return True
 
-    driver.find_element(By.ID, "btnEntrar").send_keys(Keys.ENTER)
+    btn.send_keys(Keys.ENTER)
     logging.info("[Step 1/6] Personal info")
 
-    success = False
-    if context.operation_code == OperationType.TOMA_HUELLAS:
-        success = toma_huellas_step2(driver, context)
-    elif context.operation_code == OperationType.RECOGIDA_DE_TARJETA:
-        success = recogida_de_tarjeta_step2(driver, context)
-    elif context.operation_code == OperationType.SOLICITUD_ASILO:
-        success = solicitud_asilo_step2(driver, context)
-    elif context.operation_code == OperationType.BREXIT:
-        success = brexit_step2(driver, context)
-    elif context.operation_code == OperationType.CARTA_INVITACION:
-        success = carta_invitacion_step2(driver, context)
-    elif context.operation_code in [
-        OperationType.CERTIFICADOS_NIE,
-        OperationType.CERTIFICADOS_NIE_NO_COMUN,
-        OperationType.CERTIFICADOS_RESIDENCIA,
-        OperationType.CERTIFICADOS_UE,
-    ]:
-        success = certificados_step2(driver, context)
-    elif context.operation_code == OperationType.AUTORIZACION_DE_REGRESO:
-        success = autorizacion_de_regreso_step2(driver, context)
-    elif context.operation_code == OperationType.ASIGNACION_NIE:
-        success = asignacion_nie_step2(driver, context)
+    success = fill_personal_info(driver, context)
     if not success:
         return None
 
     time.sleep(2)
-    driver.find_element(By.ID, "btnEnviar").send_keys(Keys.ENTER)
+    enviar_btn = find_element_resilient(driver, BTN_ENVIAR)
+    if enviar_btn:
+        enviar_btn.send_keys(Keys.ENTER)
+    else:
+        logging.error("Could not find enviar button")
+        return None
 
-    try:
-        WebDriverWait(driver, 7).until(
-            EC.presence_of_element_located((By.ID, "btnConsultar"))
-        )
-    except TimeoutException:
-        logging.error("Timed out waiting for Solicitar page to load")
+    # Wait for Solicitar page (non-required element, short timeout)
+    find_element_resilient(driver, BTN_CONSULTAR, timeout=7)
 
     try:
         wait_exact_time(driver, context)
@@ -973,7 +935,9 @@ def cycle_cita(
 
 def cita_selection(driver: webdriver, context: CustomerProfile):
     resp_text = body_text(driver)
-    if "DISPONE DE 5 MINUTOS" in resp_text:
+    page_state = detect_page_state(driver, resp_text)
+
+    if page_state == PageState.SLOT_SELECTION_5MIN:
         logging.info("[Step 4/6] Cita attempt -> selection hit!")
         # PAI: notify that we found a slot
         _ntfy(
@@ -994,15 +958,17 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
         if not success:
             return None
         try:
-            driver.find_elements(By.CSS_SELECTOR, "input[type='radio'][name='rdbCita']")[
-                position - 1
-            ].send_keys(Keys.SPACE)
+            radios = find_elements_resilient(driver, SLOT_RADIOS)
+            if radios and position - 1 < len(radios):
+                radios[position - 1].send_keys(Keys.SPACE)
+            else:
+                logging.error(f"Radio button at position {position} not found")
         except Exception as e:
             logging.error(e)
-        driver.execute_script("envia();")
+        submit_form_resilient(driver, "envia();")
         time.sleep(0.5)
         driver.switch_to.alert.accept()
-    elif "Seleccione una de las siguientes citas disponibles" in resp_text:
+    elif page_state == PageState.SLOT_SELECTION_TABLE:
         logging.info("[Step 4/6] Cita attempt -> selection hit!")
         _ntfy(
             "SLOT FOUND!",
@@ -1015,13 +981,15 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                 f"/app/data/citas-{dt.now()}.png".replace(":", "-")
             )
         try:
-            date_els = driver.find_elements(
-                By.CSS_SELECTOR, "#CitaMAP_HORAS thead [class^=colFecha]"
-            )
+            date_els = find_elements_resilient(driver, SLOT_TABLE_HEADERS)
             dates = sorted([*map(lambda x: x.text, date_els)])
             slots: Dict[str, list] = {}
-            slot_table = driver.find_element(By.CSS_SELECTOR, "#CitaMAP_HORAS tbody")
-            for row in slot_table.find_elements(By.CSS_SELECTOR, "tr"):
+            slot_table_el = find_element_resilient(driver, SLOT_TABLE)
+            if not slot_table_el:
+                logging.error("Could not find slot table")
+                return None
+            slot_tbody = slot_table_el.find_element(By.CSS_SELECTOR, "tbody")
+            for row in slot_tbody.find_elements(By.CSS_SELECTOR, "tr"):
                 appt_time = row.find_elements(By.TAG_NAME, "th")[0].text
                 if context.min_time:
                     if appt_time < context.min_time:
@@ -1033,9 +1001,10 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                     try:
                         if slots.get(dates[idx]):
                             continue
-                        slot = cell.find_element(
-                            By.CSS_SELECTOR, "[id^=HUECO]"
-                        ).get_attribute("id")
+                        hueco_els = cell.find_elements(By.CSS_SELECTOR, "[id^=HUECO]")
+                        if not hueco_els:
+                            continue
+                        slot = hueco_els[0].get_attribute("id")
                         slots[dates[idx]] = [slot]
                     except Exception:
                         pass
@@ -1047,7 +1016,8 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
             success = process_captcha(driver, context)
             if not success:
                 return None
-            driver.execute_script(
+            submit_form_resilient(
+                driver,
                 f"confirmarHueco({{id: '{slot}'}}, {slot[5:]});"
             )
             driver.switch_to.alert.accept()
@@ -1059,15 +1029,12 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
         return None
 
     resp_text = body_text(driver)
-    if "Debe confirmar los datos de la cita asignada" in resp_text:
+    page_state = detect_page_state(driver, resp_text)
+
+    if page_state == PageState.CONFIRMATION:
         logging.info("[Step 5/6] Cita attempt -> confirmation hit!")
         # PAI: CapMonster Cloud doesn't have report_correct, skip
-        try:
-            sms_verification = driver.find_element(
-                By.ID, "txtCodigoVerificacion"
-            )
-        except Exception:
-            sms_verification = None
+        sms_verification = find_element_resilient(driver, SMS_CODE_INPUT, timeout=3)
 
         if context.sms_webhook_token:
             # Path A: webhook.site SMS automation
@@ -1075,10 +1042,9 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                 code = get_code(context)
                 if code:
                     logging.info(f"Received code: {code}")
-                    sms_verification = driver.find_element(
-                        By.ID, "txtCodigoVerificacion"
-                    )
-                    sms_verification.send_keys(code)
+                    sms_verification = find_element_resilient(driver, SMS_CODE_INPUT)
+                    if sms_verification:
+                        sms_verification.send_keys(code)
             confirm_appointment(driver, context)
             if context.save_artifacts:
                 driver.save_screenshot(
@@ -1157,7 +1123,8 @@ def get_code(context: CustomerProfile):
 def add_reason(driver: webdriver, context: CustomerProfile):
     try:
         if context.operation_code == OperationType.SOLICITUD_ASILO:
-            element = driver.find_element(By.ID, "txtObservaciones")
-            element.send_keys(context.reason_or_type)
+            element = find_element_resilient(driver, OBSERVATIONS_INPUT)
+            if element:
+                element.send_keys(context.reason_or_type)
     except Exception as e:
         logging.error(e)
