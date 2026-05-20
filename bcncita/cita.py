@@ -272,6 +272,9 @@ def init_wedriver(context: CustomerProfile):
     options.set_preference("browser.download.dir", "/app/data")
     options.set_preference("browser.download.folderList", 2)
 
+    # Auto-accept POST resubmission dialogs on page refresh
+    options.set_preference("dom.confirm_repost.testing.always_accept", True)
+
     # Disable telemetry/update checks
     options.set_preference("toolkit.telemetry.enabled", False)
     options.set_preference("app.update.enabled", False)
