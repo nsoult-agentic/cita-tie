@@ -398,7 +398,9 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
         except TimeoutException:
             logging.error("Timeout exception")
         except Exception as e:
-            logging.error(f"SMTH BROKEN: {e}")
+            # Log only the error message, not the full Selenium/Chrome stacktrace
+            msg = str(e).split("\n")[0] if str(e) else type(e).__name__
+            logging.error(f"Error: {msg}")
             continue
 
         if result:
@@ -600,7 +602,7 @@ def solve_recaptcha(driver: webdriver, context: CustomerProfile):
             logging.error(f"CapMonster: empty response — {responses}")
             return None
     except Exception as e:
-        logging.error(f"CapMonster reCAPTCHA error: {e}")
+        logging.error(f"CapMonster reCAPTCHA error: {str(e).split(chr(10))[0]}")
         return None
 
 
@@ -634,7 +636,7 @@ def solve_image_captcha(driver: webdriver, context: CustomerProfile):
             logging.error(f"CapMonster: empty image response — {responses}")
             return None
     except Exception as e:
-        logging.error(f"CapMonster image CAPTCHA error: {e}")
+        logging.error(f"CapMonster image CAPTCHA error: {str(e).split(chr(10))[0]}")
         return None
 
 

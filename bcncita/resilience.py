@@ -307,7 +307,9 @@ def step_runner(step_num: int, step_name: str, max_retries: int = 0):
                     if not e.recoverable or attempt > max_retries:
                         return None
                 except Exception as e:
-                    err = StepError(step_num, step_name, str(e))
+                    # Strip Selenium/Chrome stacktraces — first line only
+                    msg = str(e).split("\n")[0] if str(e) else type(e).__name__
+                    err = StepError(step_num, step_name, msg)
                     _handle_failure(driver, context, err, attempt, max_retries + 1)
                     if attempt > max_retries:
                         return None
