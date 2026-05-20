@@ -1,5 +1,4 @@
 selenium>=4.15,<5
-capmonstercloudclient>=1.0
-Mako>=1.1.3
+capmonstercloudclient>=1.0,<2
 requests>=2.28
 backoff>=2.1.2

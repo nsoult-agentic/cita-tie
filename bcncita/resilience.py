@@ -4,16 +4,13 @@ Wraps Selenium interactions with fallback strategies, page state detection,
 screenshot capture, and ntfy notifications.
 """
 import functools
-import json
 import logging
-import os
 import random
 import time
 from datetime import datetime as dt
 from enum import Enum, auto
 from typing import Optional
 
-import requests as req
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
@@ -345,37 +342,12 @@ def _handle_failure(driver, context, error: StepError, attempt: int, max_attempt
         _ntfy_resilience(f"Step {error.step_num} Failed", detail, priority="high", tags="warning")
 
 
-# ── ntfy helper (reads from /secrets/) ──────────────────────────────
-
-_ntfy_config = None
-
-
-def _load_ntfy_config():
-    global _ntfy_config
-    if _ntfy_config is not None:
-        return _ntfy_config
-    secrets_dir = os.environ.get("SECRETS_DIR", "/secrets")
-    path = os.path.join(secrets_dir, "ntfy.json")
-    try:
-        with open(path) as f:
-            _ntfy_config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        _ntfy_config = {}
-    return _ntfy_config
-
+# ── ntfy helper — delegates to cita._ntfy ──────────────────────────
 
 def _ntfy_resilience(title, message, priority="default", tags=""):
-    config = _load_ntfy_config()
-    url = config.get("url", "")
-    topic = config.get("topic", "")
-    if not url or not topic:
-        return
+    """Send ntfy notification. Imports from cita to avoid duplication."""
     try:
-        req.post(
-            f"{url}/{topic}",
-            data=message.encode("utf-8"),
-            headers={"Title": title, "Priority": priority, "Tags": tags},
-            timeout=10,
-        )
+        from .cita import _ntfy
+        _ntfy(title, message, priority=priority, tags=tags)
     except Exception:
         pass

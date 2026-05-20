@@ -6,6 +6,7 @@ Secrets read from /secrets/ (mounted volume). Config from environment variables.
 import json
 import logging
 import os
+import pathlib
 import random
 import sys
 import time
@@ -144,7 +145,7 @@ def build_profile() -> CustomerProfile:
         sms_code_port=int(os.environ.get("SMS_CODE_PORT", "8080")),
     )
 
-    log.info(f"Profile: {profile.name} ({profile.doc_type.value})")
+    log.info(f"Profile loaded ({profile.doc_type.value}: {profile.doc_value[:3]}***)")
     log.info(f"Operation: {op_code_str}")
     log.info(f"Offices: {[o.name for o in offices] if offices else 'auto-select'}")
     log.info(f"CapMonster: {'enabled' if profile.auto_captcha else 'DISABLED'}")
@@ -173,8 +174,22 @@ def _ntfy(title, message, ntfy_config_raw, priority="default", tags=""):
         pass
 
 
+def cleanup_old_screenshots(data_dir="/app/data", max_age_days=7):
+    """Delete screenshots older than max_age_days to prevent PII accumulation."""
+    cutoff = time.time() - (max_age_days * 86400)
+    for f in pathlib.Path(data_dir).glob("*.png"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                log.info(f"Cleaned up old screenshot: {f.name}")
+        except Exception:
+            pass
+
+
 def main():
     profile, ntfy_config = build_profile()
+
+    cleanup_old_screenshots()
 
     _ntfy(
         "TIE Checker Started",

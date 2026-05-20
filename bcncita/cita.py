@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -148,6 +149,7 @@ def _wait_for_sms_code_http(timeout=300, port=8080):
     _sms_code_event.clear()
 
     server = HTTPServer(("0.0.0.0", port), _SMSCodeHandler)
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.timeout = 5
 
     def serve():
@@ -157,7 +159,10 @@ def _wait_for_sms_code_http(timeout=300, port=8080):
 
     t = threading.Thread(target=serve, daemon=True)
     t.start()
-    _sms_code_event.wait(timeout=timeout)
+    try:
+        _sms_code_event.wait(timeout=timeout)
+    finally:
+        server.server_close()
     return _sms_code_value
 
 
@@ -319,13 +324,12 @@ def init_wedriver(context: CustomerProfile):
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--lang=es-ES,es")
     options.add_argument("--window-size=1920,1080")
 
-    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument("--ignore-certificate-errors")
     settings = {
         "recentDestinations": [{"id": "Save as PDF"}],
         "selectedDestinationId": "Save as PDF",
@@ -333,7 +337,7 @@ def init_wedriver(context: CustomerProfile):
     }
     prefs = {
         "printing.print_preview_sticky_settings.appState": json.dumps(settings),
-        "download.default_directory": os.getcwd(),
+        "download.default_directory": "/app/data",
     }
     options.add_experimental_option("prefs", prefs)
     options.add_argument("--kiosk-printing")
@@ -341,9 +345,16 @@ def init_wedriver(context: CustomerProfile):
     # PAI: modern Selenium API with Service
     service = Service(executable_path=context.chrome_driver_path)
     browser = webdriver.Chrome(service=service, options=options)
-    browser.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
+    browser.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'languages', {get: () => ['es-ES', 'es', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            window.chrome = {runtime: {}};
+        """
+    })
+    version_info = browser.capabilities.get('browserVersion', '120.0.0.0')
+    ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version_info} Safari/537.36"
     browser.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": ua})
     return browser
 
@@ -390,6 +401,15 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
 
     success = False
     for i in range(cycles):
+        try:
+            _ = driver.title
+        except Exception:
+            logging.warning("Chrome session dead — recreating")
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            driver = init_wedriver(context)
         try:
             logging.info(f"\033[33m[Attempt {i + 1}/{cycles}]\033[0m")
             result = cycle_cita(driver, context, fast_forward_url, fast_forward_url2)
@@ -554,12 +574,8 @@ def process_captcha(driver: webdriver, context: CustomerProfile):
 
 
 def _get_capmonster_client(context: CustomerProfile) -> CapMonsterClient:
-    """Get or create CapMonster Cloud client."""
-    if not context.capmonster_client:
-        context.capmonster_client = CapMonsterClient(
-            options=ClientOptions(api_key=context.capmonster_api_key)
-        )
-    return context.capmonster_client
+    """Create a fresh CapMonster Cloud client per call — no caching."""
+    return CapMonsterClient(options=ClientOptions(api_key=context.capmonster_api_key))
 
 
 def solve_recaptcha(driver: webdriver, context: CustomerProfile):
@@ -615,7 +631,13 @@ def solve_image_captcha(driver: webdriver, context: CustomerProfile):
             logging.error("No captcha images found")
             return None
         img = imgs[0]
-        img_data = img.get_attribute("src").split(",")[1].strip()
+        src = img.get_attribute("src")
+        if src.startswith("data:"):
+            img_data = src.split(",", 1)[1].strip()
+        else:
+            import base64 as b64module
+            resp = requests.get(src, timeout=10)
+            img_data = b64module.b64encode(resp.content).decode()
         logging.info("CapMonster: solving image CAPTCHA...")
 
         client = _get_capmonster_client(context)
@@ -802,8 +824,9 @@ def confirm_appointment(driver: webdriver, context: CustomerProfile):
         logging.error("Incorrect code entered")
         _ntfy("SMS code incorrect", "The SMS code was wrong. Will retry.", priority="high", tags="x")
     else:
-        error_name = f"/app/data/error-{ctime}.png".replace(":", "-")
-        driver.save_screenshot(error_name)
+        if context.save_artifacts:
+            error_name = f"/app/data/error-{ctime}.png".replace(":", "-")
+            driver.save_screenshot(error_name)
         _ntfy("Booking error", "Unexpected page at confirmation step. Check screenshots.", priority="high", tags="warning")
     return None
 
@@ -830,7 +853,7 @@ def initial_page(
     driver.set_page_load_timeout(300 if context.first_load else 50)
     time.sleep(1)
     driver.get(fast_forward_url)
-    time.sleep(random.randint(3, 7))  # PAI: randomize wait to look more human
+    time.sleep(random.uniform(1.5, 4))  # PAI: randomize wait to look more human
 
     # PAI: check first page for rate limiting using detect_page_state
     page_state = detect_page_state(driver)
@@ -848,9 +871,9 @@ def initial_page(
         except Exception as e:
             logging.error(e)
 
-    time.sleep(random.randint(2, 5))  # PAI: pause between navigations
+    time.sleep(random.uniform(1, 3))  # PAI: pause between navigations
     driver.get(fast_forward_url2)
-    time.sleep(random.randint(3, 7))
+    time.sleep(random.uniform(1.5, 4))
 
     # PAI: detect page state after second navigation
     page_state = detect_page_state(driver)
@@ -955,7 +978,7 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
         position = find_best_date_slots(driver, context)
         if not position:
             return None
-        time.sleep(2)
+        time.sleep(0.5)
         success = process_captcha(driver, context)
         if not success:
             return None
@@ -969,7 +992,11 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
             logging.error(e)
         submit_form_resilient(driver, "envia();")
         time.sleep(0.5)
-        driver.switch_to.alert.accept()
+        try:
+            WebDriverWait(driver, 3).until(EC.alert_is_present())
+            driver.switch_to.alert.accept()
+        except (TimeoutException, Exception):
+            pass
     elif page_state == PageState.SLOT_SELECTION_TABLE:
         logging.info("[Step 4/6] Cita attempt -> selection hit!")
         _ntfy(
@@ -1014,7 +1041,7 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
             if not best_date:
                 return None
             slot = slots[best_date][0]
-            time.sleep(2)
+            time.sleep(0.5)
             success = process_captcha(driver, context)
             if not success:
                 return None
@@ -1022,7 +1049,11 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                 driver,
                 f"confirmarHueco({{id: '{slot}'}}, {slot[5:]});"
             )
-            driver.switch_to.alert.accept()
+            try:
+                WebDriverWait(driver, 3).until(EC.alert_is_present())
+                driver.switch_to.alert.accept()
+            except (TimeoutException, Exception):
+                pass
         except Exception as e:
             logging.error(e)
             return None
@@ -1043,7 +1074,7 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
             if sms_verification:
                 code = get_code(context)
                 if code:
-                    logging.info(f"Received code: {code}")
+                    logging.info("Received SMS code")
                     sms_verification = find_element_resilient(driver, SMS_CODE_INPUT)
                     if sms_verification:
                         sms_verification.send_keys(code)
@@ -1072,8 +1103,10 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                 logging.info(f"Waiting for SMS code on HTTP port {sms_port}...")
                 code = _wait_for_sms_code_http(timeout=300, port=sms_port)
                 if code:
-                    logging.info(f"Received SMS code: {code}")
-                    sms_verification.send_keys(code)
+                    logging.info("Received SMS code via HTTP")
+                    sms_el = find_element_resilient(driver, SMS_CODE_INPUT, timeout=5)
+                    if sms_el:
+                        sms_el.send_keys(code)
                     confirm_appointment(driver, context)
                     return context.bot_result or None
                 else:
