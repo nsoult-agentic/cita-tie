@@ -10,17 +10,13 @@ import logging
 import os
 import random
 import re
-import socket
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
-from base64 import b64decode
 from dataclasses import dataclass, field
 from datetime import datetime as dt
 from enum import Enum
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from json.decoder import JSONDecodeError
 from typing import Any, Dict, Optional
 
@@ -46,7 +42,6 @@ from .resilience import (
     submit_form_resilient,
     PageState,
     StepError,
-    step_runner,
     get_fallback_report,
     reset_fallback_tracking,
 )
@@ -110,59 +105,6 @@ _sms_code_value = None
 _sms_code_event = threading.Event()
 
 
-class _SMSCodeHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        global _sms_code_value
-        parsed = urllib.parse.urlparse(self.path)
-        params = urllib.parse.parse_qs(parsed.query)
-        if parsed.path == "/code" and "value" in params:
-            _sms_code_value = params["value"][0]
-            _sms_code_event.set()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"<h2>Code received! You can close this page.</h2>")
-        else:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            html = (
-                "<html><body style='font-family:sans-serif;max-width:400px;margin:40px auto'>"
-                "<h2>TIE Appointment - SMS Code</h2>"
-                "<form action='/code' method='GET'>"
-                "<input name='value' placeholder='Enter SMS code' "
-                "style='font-size:24px;padding:10px;width:100%'><br><br>"
-                "<button style='font-size:24px;padding:10px 30px'>Submit</button>"
-                "</form></body></html>"
-            )
-            self.wfile.write(html.encode())
-
-    def log_message(self, *args):
-        pass
-
-
-def _wait_for_sms_code_http(timeout=300, port=8080):
-    """Start HTTP server and wait for SMS code submission."""
-    global _sms_code_value
-    _sms_code_value = None
-    _sms_code_event.clear()
-
-    server = HTTPServer(("0.0.0.0", port), _SMSCodeHandler)
-    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.timeout = 5
-
-    def serve():
-        deadline = time.time() + timeout
-        while not _sms_code_event.is_set() and time.time() < deadline:
-            server.handle_request()
-
-    t = threading.Thread(target=serve, daemon=True)
-    t.start()
-    try:
-        _sms_code_event.wait(timeout=timeout)
-    finally:
-        server.server_close()
-    return _sms_code_value
 
 
 class DocType(str, Enum):
@@ -349,9 +291,10 @@ def try_cita(context: CustomerProfile, cycles: int = CYCLES):
 
 
 def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES):
-    logging.basicConfig(
-        format="%(asctime)s - %(message)s", level=logging.INFO, **context.log_settings
-    )
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            format="%(asctime)s - %(message)s", level=logging.INFO, **context.log_settings
+        )
     if context.sms_webhook_token:
         delete_message(context.sms_webhook_token)
 
@@ -384,11 +327,12 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
     )
 
     success = False
+    result = None
     for i in range(cycles):
         try:
             _ = driver.title
         except Exception:
-            logging.warning("Chrome session dead — recreating")
+            logging.warning("Browser session dead — recreating")
             try:
                 driver.quit()
             except Exception:
@@ -694,7 +638,7 @@ def select_office(driver: webdriver, context: CustomerProfile):
         select = Select(el)
         if context.save_artifacts:
             offices_path = os.path.join(
-                os.getcwd(), f"offices-{dt.now()}.html".replace(":", "-")
+                "/app/data", f"offices-{dt.now()}.html".replace(":", "-")
             )
             with io.open(offices_path, "w", encoding="utf-8") as f:
                 f.write(el.get_attribute("innerHTML"))
@@ -837,7 +781,7 @@ def log_backoff(details):
     base=2,
     factor=30,
     max_value=600,
-    max_tries=(10 if os.environ.get("CITA_TEST") else None),
+    max_tries=(10 if os.environ.get("CITA_TEST") else 5),
     on_backoff=log_backoff,
     logger=None,
 )
@@ -896,12 +840,18 @@ def initial_page(
         context.first_load = True
         raise TimeoutException
 
-    # Accept INITIAL_LANDING or any non-blocked state as success
+    # Accept INITIAL_LANDING or known flow states as success
     if page_state in (PageState.INITIAL_LANDING, PageState.INSTRUCTIONS,
-                      PageState.PERSONAL_INFO, PageState.OFFICE_SELECTION,
-                      PageState.UNKNOWN):
+                      PageState.PERSONAL_INFO, PageState.OFFICE_SELECTION):
         context.first_load = False
         return
+
+    if page_state == PageState.UNKNOWN:
+        logging.warning(f"Unknown page state after navigation. Title: {driver.title}, URL: {driver.current_url}")
+        if context.save_artifacts:
+            driver.save_screenshot(f"/app/data/unknown-state-{dt.now()}.png".replace(":", "-"))
+        context.first_load = True
+        raise TimeoutException
 
     # Fallback: verify body text contains expected content
     resp_text = body_text(driver)
@@ -1109,16 +1059,20 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                 confirm_appointment(driver, context)
                 return context.bot_result or None
             else:
-                # PAI: SMS needed — start HTTP endpoint and notify
+                # PAI: SMS needed — wait for code via unified health server in run.py
+                global _sms_code_value
                 sms_port = context.sms_code_port
                 _ntfy(
                     "SMS CODE NEEDED!",
-                    f"Open http://172.16.10.25:{sms_port}/ to enter the SMS code. You have 5 minutes.",
+                    f"Open http://172.16.10.25:{sms_port}/code to enter the SMS code. You have 5 minutes.",
                     priority="urgent",
                     tags="rotating_light,iphone",
                 )
-                logging.info(f"Waiting for SMS code on HTTP port {sms_port}...")
-                code = _wait_for_sms_code_http(timeout=300, port=sms_port)
+                logging.info(f"Waiting for SMS code via health server on port {sms_port}...")
+                _sms_code_event.clear()
+                _sms_code_value = None
+                _sms_code_event.wait(timeout=300)
+                code = _sms_code_value
                 if code:
                     logging.info("Received SMS code via HTTP")
                     sms_el = find_element_resilient(driver, SMS_CODE_INPUT, timeout=5)

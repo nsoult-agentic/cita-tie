@@ -43,6 +43,38 @@ _stats = {
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        import urllib.parse
+        parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path == "/code":
+            # SMS code handler — sets the shared event in bcncita.cita
+            params = urllib.parse.parse_qs(parsed.query)
+            if "value" in params:
+                from bcncita.cita import _sms_code_event
+                import bcncita.cita as _cita_mod
+                _cita_mod._sms_code_value = params["value"][0]
+                _sms_code_event.set()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<h2>Code received! You can close this page.</h2>")
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                html = (
+                    "<html><body style='font-family:sans-serif;max-width:400px;margin:40px auto'>"
+                    "<h2>TIE Appointment - SMS Code</h2>"
+                    "<form action='/code' method='GET'>"
+                    "<input name='value' placeholder='Enter SMS code' "
+                    "style='font-size:24px;padding:10px;width:100%'><br><br>"
+                    "<button style='font-size:24px;padding:10px 30px'>Submit</button>"
+                    "</form></body></html>"
+                )
+                self.wfile.write(html.encode())
+            return
+
+        # Default: health endpoint
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -294,6 +326,7 @@ def main():
         profile.current_solver = None
         profile.first_load = True
         profile.bot_result = False
+        profile._rate_limit_count = 0
 
         # Add jitter to avoid pattern detection
         jitter = random.uniform(0, sleep_time * 0.3)

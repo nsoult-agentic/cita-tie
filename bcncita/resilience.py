@@ -41,8 +41,8 @@ def find_element_resilient(
     for idx, (by, value) in enumerate(descriptor.strategies):
         try:
             if idx == 0:
-                # Fast path: short wait for known-good selector
-                wait = min(effective_timeout, 3.0)
+                # Primary strategy: use full timeout
+                wait = effective_timeout
                 if multiple:
                     WebDriverWait(driver, wait).until(
                         lambda d: len(d.find_elements(by, value)) > 0
@@ -213,7 +213,10 @@ _PRIORITY_ORDER = [
 
 
 def detect_page_state(driver: WebDriver, body_text_cache: str = None) -> PageState:
-    """Classify current page using multiple signals."""
+    """Classify current page using multiple signals.
+    Optimized: checks all text/title patterns first (cheap string ops),
+    only falls back to element checks if no text pattern matched.
+    """
     if body_text_cache is None:
         try:
             body_text_cache = driver.find_element("tag name", "body").text
@@ -226,19 +229,28 @@ def detect_page_state(driver: WebDriver, body_text_cache: str = None) -> PageSta
     except Exception:
         pass
 
+    body_lower = body_text_cache.lower()
+    title_lower = title.lower()
+
+    # Pass 1: text and title patterns only (cheap string ops, no Selenium calls)
     for state in _PRIORITY_ORDER:
         signals = _STATE_SIGNALS[state]
 
         for pattern, case_sensitive in signals["text"]:
             if case_sensitive and pattern in body_text_cache:
                 return state
-            if not case_sensitive and pattern.lower() in body_text_cache.lower():
+            if not case_sensitive and pattern.lower() in body_lower:
                 return state
 
         for pattern in signals["title"]:
-            if pattern.lower() in title.lower():
+            if pattern.lower() in title_lower:
                 return state
 
+    # Pass 2: element checks only for states that have them (expensive Selenium calls)
+    for state in _PRIORITY_ORDER:
+        signals = _STATE_SIGNALS[state]
+        if not signals["elements"]:
+            continue
         for elem_id in signals["elements"]:
             try:
                 if driver.find_elements("id", elem_id):
