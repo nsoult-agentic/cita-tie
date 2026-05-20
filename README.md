@@ -17,37 +17,21 @@ Follows the standard GitOps pattern: GitHub Actions → GHCR → Portainer stack
 
 ### 1. Secrets (on host)
 
-Create `/srv/cita-tie/secrets/` with these files:
-
-```
-/srv/cita-tie/secrets/
-├── profile.json          # Personal details (see below)
-├── capmonster-api-key    # CapMonster Cloud API key (plain text)
-├── ntfy.json             # ntfy push config (see below)
-└── sms-webhook-token     # Optional: webhook.site token
+```bash
+sudo mkdir -p /srv/cita-tie/secrets /srv/cita-tie/data
+sudo cp secrets.example/* /srv/cita-tie/secrets/
 ```
 
-**profile.json:**
-```json
-{
-  "name": "YOUR FULL NAME",
-  "doc_type": "nie",
-  "doc_value": "Y1234567X",
-  "phone": "600123456",
-  "email": "your@email.com",
-  "country": "ESTADOS UNIDOS"
-}
-```
+Then edit each file in `/srv/cita-tie/secrets/` — replace `CHANGE_ME` placeholders with real values.
 
-**ntfy.json:**
-```json
-{
-  "url": "https://ntfy.example.com",
-  "topic": "cita-tie"
-}
-```
+| File | What to fill in |
+|------|----------------|
+| `profile.json` | name (as on NIE), doc_type, doc_value, phone, email, country (Spanish, all caps) |
+| `capmonster-api-key` | API key from https://capmonster.cloud |
+| `ntfy.json` | Already pre-filled with your ntfy URL |
+| `sms-webhook-token` | Optional — leave as-is if not using webhook.site |
 
-**capmonster-api-key:** Plain text file with your API key from https://capmonster.cloud
+Templates are in `secrets.example/` in this repo.
 
 ### 2. Data directory
 
