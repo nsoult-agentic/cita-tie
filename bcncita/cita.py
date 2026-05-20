@@ -838,9 +838,11 @@ def log_backoff(details):
 
 
 @backoff.on_exception(
-    backoff.constant,
+    backoff.expo,
     TimeoutException,
-    interval=350,
+    base=2,
+    factor=30,
+    max_value=600,
     max_tries=(10 if os.environ.get("CITA_TEST") else None),
     on_backoff=log_backoff,
     logger=None,
@@ -858,8 +860,12 @@ def initial_page(
     # PAI: check first page for rate limiting using detect_page_state
     page_state = detect_page_state(driver)
     if page_state == PageState.RATE_LIMITED:
-        wait_sec = random.randint(120, 300)
-        logging.warning(f"First page blocked ({driver.title}) — sleeping {wait_sec}s")
+        _rate_limit_count = getattr(context, '_rate_limit_count', 0) + 1
+        context._rate_limit_count = _rate_limit_count
+        # Exponential: 5min, 10min, 15min, cap 20min
+        wait_min = min(5 * _rate_limit_count, 20)
+        wait_sec = int(wait_min * 60 + random.uniform(0, 60))
+        logging.warning(f"Rate limited (hit #{_rate_limit_count}) — sleeping {wait_sec}s ({wait_min}+ min)")
         time.sleep(wait_sec)
         context.first_load = True
         raise TimeoutException
@@ -879,8 +885,11 @@ def initial_page(
     page_state = detect_page_state(driver)
 
     if page_state == PageState.RATE_LIMITED:
-        wait_sec = random.randint(120, 300)
-        logging.warning(f"429 Rate Limited — sleeping {wait_sec}s before retry")
+        _rate_limit_count = getattr(context, '_rate_limit_count', 0) + 1
+        context._rate_limit_count = _rate_limit_count
+        wait_min = min(5 * _rate_limit_count, 20)
+        wait_sec = int(wait_min * 60 + random.uniform(0, 60))
+        logging.warning(f"Rate limited (hit #{_rate_limit_count}) — sleeping {wait_sec}s ({wait_min}+ min)")
         time.sleep(wait_sec)
         context.first_load = True
         raise TimeoutException
@@ -911,6 +920,7 @@ def initial_page(
         context.first_load = True
         raise TimeoutException
     context.first_load = False
+    context._rate_limit_count = 0  # Reset on success
 
 
 def cycle_cita(
