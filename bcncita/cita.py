@@ -725,10 +725,8 @@ def office_selection(driver: webdriver, context: CustomerProfile):
                     driver.execute_script("arguments[0].click();", btn)
             return True
         elif page_state == PageState.NO_APPOINTMENTS:
-            logging.info("No appointments available — retrying...")
-            time.sleep(5)
-            driver.refresh()
-            continue
+            logging.info("No appointments available — starting fresh cycle")
+            return None
         elif page_state == PageState.RATE_LIMITED:
             logging.warning("Rate limited during office selection — aborting cycle")
             _capture_diagnostics(driver, "rate-limited-office-selection")
