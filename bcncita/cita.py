@@ -856,7 +856,12 @@ def handle_validation_page(driver: webdriver, context: CustomerProfile):
 
 
 def office_selection(driver: webdriver, context: CustomerProfile):
-    submit_form_resilient(driver, "enviar('solicitud');", BTN_ENVIAR)
+    # Only submit if we're not already on a recognized flow page
+    # (handle_validation_page may have already advanced us past the submit step)
+    pre_state = detect_page_state(driver)
+    if pre_state not in (PageState.OFFICE_SELECTION, PageState.NO_APPOINTMENTS,
+                         PageState.RATE_LIMITED, PageState.INITIAL_LANDING):
+        submit_form_resilient(driver, "enviar('solicitud');", BTN_ENVIAR)
     for i in range(REFRESH_PAGE_CYCLES):
         resp_text = body_text(driver)
         page_state = detect_page_state(driver, resp_text)
