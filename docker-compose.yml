@@ -1,6 +1,6 @@
 services:
   cita-tie:
-    image: ghcr.io/nsoult-agentic/cita-tie:sha-e494ba8
+    image: ghcr.io/nsoult-agentic/cita-tie:sha-06a6a1d
     container_name: cita-tie
     restart: unless-stopped
     ports:
