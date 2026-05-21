@@ -178,8 +178,8 @@ _STATE_SIGNALS = {
         "elements": ["idSede"],
     },
     PageState.PERSONAL_INFO: {
-        "text": [],
-        "title": [],
+        "text": [("Rellene los campos siguientes", False), ("Nombre y apellidos", False)],
+        "title": ["Rellene los campos"],
         "elements": ["txtIdCitado"],
     },
     PageState.INSTRUCTIONS: {
@@ -188,7 +188,7 @@ _STATE_SIGNALS = {
         "elements": ["btnEntrar"],
     },
     PageState.INITIAL_LANDING: {
-        "text": [("CITA PREVIA", False)],
+        "text": [("PROVINCIAS DISPONIBLES", False), ("Selecciona Provincia", False)],
         "title": [],
         "elements": [],
     },
