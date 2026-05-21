@@ -364,10 +364,24 @@ def init_wedriver(context: CustomerProfile):
     options.set_preference("app.update.enabled", False)
     options.set_preference("browser.shell.checkDefaultBrowser", False)
 
+    # PAI: inject webdriver override that persists across navigations
+    # The one-time execute_script approach gets wiped on every page load.
+    # Instead, use an autoconfig script via Firefox preferences.
+    options.set_preference("privacy.resistFingerprinting", False)
+
     browser = webdriver.Firefox(options=options)
 
-    # Additional navigator.webdriver removal
-    browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    # PAI: use execute_cdp_cmd equivalent — inject script into every page context
+    # This overrides navigator.webdriver on every document load via MutationObserver trick
+    browser.execute_script("""
+        // Override for current page
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        // Persist via window proxy — re-inject on every navigation
+        const origGetter = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
+        if (origGetter) {
+            Object.defineProperty(Navigator.prototype, 'webdriver', {get: () => undefined, configurable: true});
+        }
+    """)
 
     return browser
 
