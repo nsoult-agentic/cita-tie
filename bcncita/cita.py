@@ -65,6 +65,65 @@ DELAY = 30
 speaker = new_speaker()
 
 
+# PAI: classify cycle result for metrics logging
+def _classify_result(result, driver):
+    """Return a short label for the cycle outcome based on result and last log."""
+    if result is True:
+        return "SUCCESS"
+    # Check recent page state for more detail
+    try:
+        ps = detect_page_state(driver)
+        return ps.name
+    except Exception:
+        return "ERROR"
+
+
+# PAI: fingerprint test mode — navigates to bot detection sites, screenshots, exits
+def fingerprint_test():
+    """Run fingerprint audit against detection sites. Set FINGERPRINT_TEST=1 to activate."""
+    logging.info("=== FINGERPRINT TEST MODE ===")
+    options = webdriver.FirefoxOptions()
+    options.add_argument("--headless")
+    options.add_argument("--width=1920")
+    options.add_argument("--height=1080")
+    options.set_preference("dom.webdriver.enabled", False)
+    options.set_preference("useAutomationExtension", False)
+    options.set_preference("intl.accept_languages", "es-ES,es,en")
+    options.set_preference("general.useragent.locale", "es-ES")
+    options.set_preference("dom.confirm_repost.testing.always_accept", True)
+    options.set_preference("toolkit.telemetry.enabled", False)
+    options.set_preference("app.update.enabled", False)
+    options.set_preference("browser.shell.checkDefaultBrowser", False)
+    browser = webdriver.Firefox(options=options)
+    browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    try:
+        # Test 1: CreepJS
+        logging.info("Navigating to CreepJS...")
+        browser.get("https://abrahamjuliot.github.io/creepjs/")
+        time.sleep(15)
+        browser.save_screenshot("/app/data/fingerprint-creepjs.png")
+        logging.info("CreepJS screenshot saved")
+
+        # Test 2: SannyBot
+        logging.info("Navigating to bot.sannysoft.com...")
+        browser.get("https://bot.sannysoft.com/")
+        time.sleep(5)
+        browser.save_screenshot("/app/data/fingerprint-sannysoft.png")
+        logging.info("SannyBot screenshot saved")
+
+        # Log key signals
+        webdriver_val = browser.execute_script("return navigator.webdriver")
+        plugins_count = browser.execute_script("return navigator.plugins.length")
+        ua = browser.execute_script("return navigator.userAgent")
+        logging.info(f"[FINGERPRINT] navigator.webdriver={webdriver_val}")
+        logging.info(f"[FINGERPRINT] navigator.plugins.length={plugins_count}")
+        logging.info(f"[FINGERPRINT] userAgent={ua}")
+    finally:
+        browser.quit()
+    logging.info("=== FINGERPRINT TEST COMPLETE ===")
+
+
 # PAI: diagnostic capture on any failure — screenshot + page state + context
 def _capture_diagnostics(driver: webdriver, label: str, save_artifacts: bool = True):
     """Log page state, URL, title, and first 500 chars of body text. Save screenshot."""
@@ -368,7 +427,16 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
             driver = init_wedriver(context)
         try:
             logging.info(f"\033[33m[Attempt {i + 1}/{cycles}]\033[0m")
+            _cycle_start = time.time()
             result = cycle_cita(driver, context, fast_forward_url, fast_forward_url2)
+            _cycle_dur = time.time() - _cycle_start
+            _rl_count = getattr(context, '_rate_limit_count', 0)
+            _fl = getattr(context, 'first_load', True)
+            # PAI: structured metrics for experiment analysis
+            logging.info(
+                f"[METRICS] cycle={i+1} result={_classify_result(result, driver)} "
+                f"duration_s={_cycle_dur:.1f} rate_limit_count={_rl_count} first_load={_fl}"
+            )
         except KeyboardInterrupt:
             raise
         except TimeoutException:

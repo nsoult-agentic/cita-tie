@@ -15,6 +15,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from bcncita import CustomerProfile, DocType, Office, OperationType, Province, try_cita
+from bcncita.cita import fingerprint_test
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -106,10 +107,10 @@ HOT_WINDOWS = [
     (20, 0, 21, 0),   # 20:00-21:00 — evening release
 ]
 
-HOT_CYCLES = 30        # attempts per hot-window run (~15 min at 30s each)
-HOT_SLEEP = 15         # seconds between hot-window runs
-COLD_CYCLES = 5        # attempts per cold-window run
-COLD_SLEEP = 180       # seconds between cold-window runs (3 min)
+HOT_CYCLES = int(os.environ.get("HOT_CYCLES", "30"))
+HOT_SLEEP = int(os.environ.get("HOT_SLEEP", "15"))
+COLD_CYCLES = int(os.environ.get("COLD_CYCLES", "5"))
+COLD_SLEEP = int(os.environ.get("COLD_SLEEP", "180"))
 
 # Office name → enum mapping
 OFFICE_MAP = {name: member for name, member in Office.__members__.items()}
@@ -271,6 +272,11 @@ def _heartbeat_summary():
 
 
 def main():
+    # PAI: fingerprint test mode — test bot detection signals and exit
+    if os.environ.get("FINGERPRINT_TEST"):
+        fingerprint_test()
+        return
+
     profile, ntfy_config = build_profile()
 
     _stats["start_time"] = time.time()
@@ -324,7 +330,7 @@ def main():
         # Reset solver state for next run (new browser session)
         profile.capmonster_client = None
         profile.current_solver = None
-        profile.first_load = True
+        profile.first_load = os.environ.get("PRESERVE_COOKIES", "").lower() != "true"
         profile.bot_result = False
         profile._rate_limit_count = 0
 
