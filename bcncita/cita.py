@@ -65,6 +65,31 @@ DELAY = 30
 speaker = new_speaker()
 
 
+# PAI: diagnostic capture on any failure — screenshot + page state + context
+def _capture_diagnostics(driver: webdriver, label: str, save_artifacts: bool = True):
+    """Log page state, URL, title, and first 500 chars of body text. Save screenshot."""
+    try:
+        url = driver.current_url
+        title = driver.title
+        page_state = detect_page_state(driver)
+        body = ""
+        try:
+            body_el = driver.find_element(By.TAG_NAME, "body")
+            body = body_el.text[:500] if body_el else ""
+        except Exception:
+            pass
+        logging.error(f"[DIAG:{label}] URL: {url}")
+        logging.error(f"[DIAG:{label}] Title: {title}")
+        logging.error(f"[DIAG:{label}] PageState: {page_state}")
+        if body:
+            logging.error(f"[DIAG:{label}] Body (500): {body[:500]}")
+        if save_artifacts:
+            ts = dt.now().strftime("%Y%m%d-%H%M%S")
+            driver.save_screenshot(f"/app/data/diag-{label}-{ts}.png")
+    except Exception as e:
+        logging.error(f"[DIAG:{label}] Diagnostic capture failed: {e}")
+
+
 # PAI: ntfy notification helper — reads config from /secrets/ntfy.json
 _ntfy_config = None
 
@@ -410,6 +435,7 @@ def fill_personal_info(driver: webdriver, context: CustomerProfile):
         el = find_element_resilient(driver, COUNTRY_SELECT, timeout=DELAY)
         if not el:
             logging.error("Timed out waiting for form to load")
+            _capture_diagnostics(driver, "country-select-missing")
             return None
         select = Select(el)
         select.select_by_visible_text(context.country)
@@ -418,6 +444,7 @@ def fill_personal_info(driver: webdriver, context: CustomerProfile):
         el = find_element_resilient(driver, DOC_NUMBER_INPUT, timeout=DELAY)
         if not el:
             logging.error("Timed out waiting for form to load")
+            _capture_diagnostics(driver, "doc-input-missing")
             return None
 
     # Select document type radio button
@@ -439,6 +466,7 @@ def fill_personal_info(driver: webdriver, context: CustomerProfile):
     element = find_element_resilient(driver, DOC_NUMBER_INPUT)
     if not element:
         logging.error("Could not find document number input")
+        _capture_diagnostics(driver, "doc-input-missing-2nd")
         return None
 
     if needs_year and context.year_of_birth:
@@ -637,6 +665,7 @@ def select_office(driver: webdriver, context: CustomerProfile):
         el = find_element_resilient(driver, OFFICE_SELECT)
         if not el:
             logging.error("Could not find office select element")
+            _capture_diagnostics(driver, "office-select-missing")
             return None
         select = Select(el)
         if context.save_artifacts:
@@ -679,6 +708,7 @@ def office_selection(driver: webdriver, context: CustomerProfile):
             btn = find_element_resilient(driver, BTN_SIGUIENTE, timeout=DELAY)
             if not btn:
                 logging.error("Timed out waiting for offices to load")
+                _capture_diagnostics(driver, "offices-siguiente-missing")
                 return None
             res = select_office(driver, context)
             if res is None:
@@ -701,6 +731,7 @@ def office_selection(driver: webdriver, context: CustomerProfile):
             continue
         else:
             logging.info("[Step 2/6] Office selection -> No offices")
+            _capture_diagnostics(driver, "office-unexpected-state")
             return None
 
 
@@ -708,6 +739,7 @@ def phone_mail(driver: webdriver, context: CustomerProfile):
     element = find_element_resilient(driver, PHONE_INPUT, timeout=DELAY)
     if not element:
         logging.error("Timed out waiting for contact info page to load")
+        _capture_diagnostics(driver, "phone-input-missing")
         return None
     logging.info("[Step 3/6] Contact info")
     element.send_keys(context.phone)
@@ -878,6 +910,7 @@ def cycle_cita(
     btn = find_element_resilient(driver, BTN_ENTRAR, timeout=DELAY)
     if not btn:
         logging.error("Timed out waiting for Instructions page to load")
+        _capture_diagnostics(driver, "entrar-not-found", context.save_artifacts)
         return None
 
     if os.environ.get("CITA_TEST") and context.operation_code == OperationType.TOMA_HUELLAS:
@@ -910,6 +943,7 @@ def cycle_cita(
             driver.execute_script("arguments[0].click();", enviar_btn)
     else:
         logging.error("Could not find enviar button")
+        _capture_diagnostics(driver, "enviar-missing", context.save_artifacts)
         return None
 
     # Wait for Solicitar page (non-required element, short timeout)
@@ -919,6 +953,7 @@ def cycle_cita(
         wait_exact_time(driver, context)
     except TimeoutException:
         logging.error("Timed out waiting for exact time")
+        _capture_diagnostics(driver, "exact-time-timeout", context.save_artifacts)
         return None
 
     selection_result = office_selection(driver, context)
@@ -1029,6 +1064,7 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
             return None
     else:
         logging.info("[Step 4/6] Cita attempt -> missed selection")
+        _capture_diagnostics(driver, "cita-missed-selection")
         return None
 
     resp_text = body_text(driver)
@@ -1094,6 +1130,7 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                     return None
     else:
         logging.info("[Step 5/6] Cita attempt -> missed confirmation")
+        _capture_diagnostics(driver, "missed-confirmation")
         # PAI: CapMonster Cloud doesn't have report_incorrect, skip
         if context.save_artifacts:
             driver.save_screenshot(
