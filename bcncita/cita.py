@@ -729,8 +729,23 @@ def office_selection(driver: webdriver, context: CustomerProfile):
             time.sleep(5)
             driver.refresh()
             continue
+        elif page_state == PageState.RATE_LIMITED:
+            logging.warning("Rate limited during office selection — aborting cycle")
+            _capture_diagnostics(driver, "rate-limited-office-selection")
+            _rate_limit_count = getattr(context, '_rate_limit_count', 0) + 1
+            context._rate_limit_count = _rate_limit_count
+            wait_min = min(5 * _rate_limit_count, 20)
+            wait_sec = int(wait_min * 60 + random.uniform(0, 60))
+            logging.warning(f"Rate limited (hit #{_rate_limit_count}) — sleeping {wait_sec}s ({wait_min}+ min)")
+            time.sleep(wait_sec)
+            context.first_load = True
+            return None
+        elif page_state == PageState.INITIAL_LANDING:
+            logging.warning("Session reset — bounced back to province selection")
+            _capture_diagnostics(driver, "session-reset-office")
+            return None
         else:
-            logging.info("[Step 2/6] Office selection -> No offices")
+            logging.info("[Step 2/6] Office selection -> unexpected state")
             _capture_diagnostics(driver, "office-unexpected-state")
             return None
 
@@ -927,6 +942,25 @@ def cycle_cita(
         # Fallback: JS click bypasses overlay/visibility issues
         driver.execute_script("arguments[0].click();", btn)
     logging.info("[Step 1/6] Personal info")
+
+    # PAI: check page state before filling form — WAF may have blocked this navigation
+    time.sleep(1)
+    page_state = detect_page_state(driver)
+    if page_state == PageState.RATE_LIMITED:
+        logging.warning("Rate limited after Entrar click — aborting cycle")
+        _capture_diagnostics(driver, "rate-limited-after-entrar", context.save_artifacts)
+        _rate_limit_count = getattr(context, '_rate_limit_count', 0) + 1
+        context._rate_limit_count = _rate_limit_count
+        wait_min = min(5 * _rate_limit_count, 20)
+        wait_sec = int(wait_min * 60 + random.uniform(0, 60))
+        logging.warning(f"Rate limited (hit #{_rate_limit_count}) — sleeping {wait_sec}s ({wait_min}+ min)")
+        time.sleep(wait_sec)
+        context.first_load = True
+        return None
+    if page_state == PageState.INITIAL_LANDING:
+        logging.warning("Bounced back to landing page after Entrar — session dead")
+        _capture_diagnostics(driver, "session-reset-after-entrar", context.save_artifacts)
+        return None
 
     success = fill_personal_info(driver, context)
     if not success:
