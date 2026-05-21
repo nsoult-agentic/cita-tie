@@ -120,6 +120,7 @@ class PageState(Enum):
     CONFIRMATION = auto()
     SUCCESS = auto()
     SMS_CODE_WRONG = auto()
+    VALIDATION_PAGE = auto()
     UNKNOWN = auto()
 
 
@@ -192,6 +193,12 @@ _STATE_SIGNALS = {
         "title": [],
         "elements": [],
     },
+    PageState.VALIDATION_PAGE: {
+        "text": [],
+        "title": [],
+        "elements": [],
+        "url_contains": "acValidarEntrada",
+    },
 }
 
 # Check in this order: blockers first, then success, then flow states in reverse
@@ -207,6 +214,7 @@ _PRIORITY_ORDER = [
     PageState.CONTACT_INFO,
     PageState.OFFICE_SELECTION,
     PageState.PERSONAL_INFO,
+    PageState.VALIDATION_PAGE,
     PageState.INSTRUCTIONS,
     PageState.INITIAL_LANDING,
 ]
@@ -229,6 +237,12 @@ def detect_page_state(driver: WebDriver, body_text_cache: str = None) -> PageSta
     except Exception:
         pass
 
+    url = ""
+    try:
+        url = driver.current_url or ""
+    except Exception:
+        pass
+
     body_lower = body_text_cache.lower()
     title_lower = title.lower()
 
@@ -245,6 +259,10 @@ def detect_page_state(driver: WebDriver, body_text_cache: str = None) -> PageSta
         for pattern in signals["title"]:
             if pattern.lower() in title_lower:
                 return state
+
+        url_pattern = signals.get("url_contains")
+        if url_pattern and url_pattern in url:
+            return state
 
     # Pass 2: element checks only for states that have them (expensive Selenium calls)
     for state in _PRIORITY_ORDER:

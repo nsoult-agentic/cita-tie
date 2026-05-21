@@ -142,6 +142,14 @@ def _capture_diagnostics(driver: webdriver, label: str, save_artifacts: bool = T
         logging.error(f"[DIAG:{label}] PageState: {page_state}")
         if body:
             logging.error(f"[DIAG:{label}] Body (500): {body[:500]}")
+        try:
+            page_source = driver.page_source
+            source_len = len(page_source) if page_source else 0
+            logging.error(f"[DIAG:{label}] page_source_len: {source_len}")
+            if source_len < 2000:
+                logging.error(f"[DIAG:{label}] page_source: {page_source}")
+        except Exception:
+            pass
         if save_artifacts:
             ts = dt.now().strftime("%Y%m%d-%H%M%S")
             driver.save_screenshot(f"/app/data/diag-{label}-{ts}.png")
@@ -778,6 +786,75 @@ def select_office(driver: webdriver, context: CustomerProfile):
         return None
 
 
+def handle_validation_page(driver: webdriver, context: CustomerProfile):
+    """Handle the acValidarEntrada intermediate validation page (ICP+ Step 4/8).
+
+    After personal info submission, the server sometimes returns this page
+    with a btnEnviar button that must be clicked to proceed. If the page
+    is blank (F5 WAF challenge), wait and retry once.
+    """
+    page_state = detect_page_state(driver)
+
+    if page_state != PageState.VALIDATION_PAGE:
+        return True
+
+    logging.info("[Step 1.5/6] Validation page (acValidarEntrada) detected")
+
+    # Log page source for F5 challenge diagnosis
+    try:
+        page_source = driver.page_source
+        source_len = len(page_source) if page_source else 0
+        logging.info(f"[DIAG:validation-page] page_source length: {source_len}")
+        if source_len < 1000:
+            logging.info(f"[DIAG:validation-page] page_source: {page_source}")
+        else:
+            logging.info(f"[DIAG:validation-page] page_source (first 1000): {page_source[:1000]}")
+    except Exception:
+        pass
+
+    # Try to find and click btnEnviar
+    btn = find_element_resilient(driver, BTN_ENVIAR, timeout=5)
+    if btn:
+        logging.info("[Step 1.5/6] Clicking btnEnviar on validation page")
+        try:
+            driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+            time.sleep(0.3)
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
+        time.sleep(1)
+        return True
+
+    # Blank page — likely F5 JS challenge. Wait and check again.
+    logging.warning("[Step 1.5/6] Blank validation page (no btnEnviar) — possible F5 challenge")
+    _capture_diagnostics(driver, "validation-page-blank")
+
+    time.sleep(5)
+
+    # Re-check: did the challenge resolve and expose btnEnviar?
+    btn = find_element_resilient(driver, BTN_ENVIAR, timeout=5)
+    if btn:
+        logging.info("[Step 1.5/6] btnEnviar appeared after wait — clicking")
+        try:
+            driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+            time.sleep(0.3)
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
+        time.sleep(1)
+        return True
+
+    # Check if page state changed (F5 may have redirected)
+    new_state = detect_page_state(driver)
+    if new_state != PageState.VALIDATION_PAGE and new_state != PageState.UNKNOWN:
+        logging.info(f"[Step 1.5/6] Page transitioned to {new_state.name} after wait")
+        return True
+
+    logging.error("[Step 1.5/6] Validation page stuck — aborting cycle")
+    _capture_diagnostics(driver, "validation-page-stuck")
+    return None
+
+
 def office_selection(driver: webdriver, context: CustomerProfile):
     submit_form_resilient(driver, "enviar('solicitud');", BTN_ENVIAR)
     for i in range(REFRESH_PAGE_CYCLES):
@@ -1058,6 +1135,12 @@ def cycle_cita(
     else:
         logging.error("Could not find enviar button")
         _capture_diagnostics(driver, "enviar-missing", context.save_artifacts)
+        return None
+
+    # Handle acValidarEntrada intermediate page if present
+    time.sleep(1)
+    validation_result = handle_validation_page(driver, context)
+    if validation_result is None:
         return None
 
     # Wait for Solicitar page (non-required element, short timeout)
