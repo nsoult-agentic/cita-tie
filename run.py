@@ -42,10 +42,26 @@ _stats = {
 }
 
 
+# ── Remote orchestration state (manual control of one Selenium driver) ──
+_ctl = {"driver": None, "profile": None}
+
+
+def _ctl_get_driver():
+    """Lazily create/reuse a single Selenium driver for remote orchestration."""
+    if _ctl["driver"] is None:
+        from bcncita.cita import init_wedriver
+        _ctl["driver"] = init_wedriver(_ctl.get("profile"))
+    return _ctl["driver"]
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         import urllib.parse
         parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path.startswith("/control/"):
+            self._control(parsed)
+            return
 
         if parsed.path == "/code":
             # SMS code handler — sets the shared event in bcncita.cita
@@ -84,12 +100,81 @@ class _HealthHandler(BaseHTTPRequestHandler):
         stats["start_time"] = str(datetime.fromtimestamp(stats["start_time"])) if stats["start_time"] else None
         self.wfile.write(json.dumps(stats, indent=2).encode())
 
+    def _cjson(self, obj, code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj, default=str).encode())
+
+    def _control(self, parsed):
+        """Remote browser orchestration. Secrets (NIE) stay in this container."""
+        import urllib.parse
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import Select
+        q = urllib.parse.parse_qs(parsed.query)
+        cmd = parsed.path[len("/control/"):]
+        try:
+            d = _ctl_get_driver()
+            if cmd == "nav":
+                d.get(q["url"][0])
+                time.sleep(float(q.get("wait", ["2"])[0]))
+                return self._cjson({"url": d.current_url, "title": d.title})
+            if cmd == "state":
+                return self._cjson({"url": d.current_url, "title": d.title})
+            if cmd == "text":
+                return self._cjson({"text": d.find_element(By.TAG_NAME, "body").text[:7000]})
+            if cmd == "dom":
+                sel = q.get("selector", ["body"])[0]
+                html = d.execute_script(
+                    "var e=document.querySelector(arguments[0]);return e?e.outerHTML:null;", sel)
+                return self._cjson({"selector": sel, "html": (html or "")[:9000]})
+            if cmd == "screenshot":
+                path = "/app/data/control-%s.png" % datetime.now().strftime("%H%M%S")
+                d.save_screenshot(path)
+                return self._cjson({"saved": path})
+            if cmd == "click":
+                d.find_element(By.CSS_SELECTOR, q["selector"][0]).click()
+                time.sleep(float(q.get("wait", ["1.5"])[0]))
+                return self._cjson({"ok": True, "url": d.current_url, "title": d.title})
+            if cmd == "select":
+                Select(d.find_element(By.CSS_SELECTOR, q["selector"][0])).select_by_value(q["value"][0])
+                time.sleep(float(q.get("wait", ["1.5"])[0]))
+                return self._cjson({"ok": True, "url": d.current_url, "title": d.title})
+            if cmd == "fillprofile":
+                from bcncita.cita import fill_personal_info
+                ok = fill_personal_info(d, _ctl["profile"])
+                return self._cjson({"ok": bool(ok), "url": d.current_url})
+            if cmd == "quit":
+                try:
+                    d.quit()
+                except Exception:
+                    pass
+                _ctl["driver"] = None
+                return self._cjson({"ok": True})
+            return self._cjson({"error": "unknown command: %s" % cmd}, 404)
+        except Exception as e:
+            return self._cjson({"error": str(e).splitlines()[0] if str(e) else type(e).__name__}, 500)
+
+    def do_POST(self):
+        import urllib.parse
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/control/eval":
+            ln = int(self.headers.get("Content-Length", "0"))
+            js = self.rfile.read(ln).decode("utf-8")
+            try:
+                d = _ctl_get_driver()
+                return self._cjson({"result": d.execute_script(js)})
+            except Exception as e:
+                return self._cjson({"error": str(e).splitlines()[0] if str(e) else type(e).__name__}, 500)
+        self._cjson({"error": "not found"}, 404)
+
     def log_message(self, *args):
         pass
 
 
 def _start_health_server(port=8080):
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    from http.server import ThreadingHTTPServer
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
     import socket
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     t = threading.Thread(target=server.serve_forever, daemon=True)
@@ -282,6 +367,23 @@ def main():
     if os.environ.get("FINGERPRINT_TEST"):
         fingerprint_test()
         return
+
+    # PAI: orchestrate-only mode — pause the automated polling loop and expose the
+    # /control/* API so the booking flow is driven remotely, step-by-step. The
+    # container holds the secrets (NIE) and uses them internally (/control/fillprofile),
+    # so PII never leaves the container.
+    if os.environ.get("ORCHESTRATE_ONLY", "").lower() == "true":
+        _stats["start_time"] = time.time()
+        _stats["last_state"] = "orchestrate-only (automation paused)"
+        _start_health_server(port=int(os.environ.get("SMS_CODE_PORT", "8080")))
+        try:
+            profile, _ = build_profile()
+            _ctl["profile"] = profile
+            log.info("ORCHESTRATE_ONLY: profile loaded; automated polling PAUSED. Control API on /control/*")
+        except SystemExit:
+            log.error("ORCHESTRATE_ONLY: profile load failed; control API still up (no profile)")
+        while True:
+            time.sleep(3600)
 
     # Start health server FIRST so the endpoint is observable even if
     # build_profile() exits or Firefox/Xvfb init fails downstream.
