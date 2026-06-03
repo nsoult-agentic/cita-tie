@@ -1014,6 +1014,51 @@ def log_backoff(details):
     )
 
 
+def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_param, op_val):
+    """Replicate the REAL human portada flow: pick the office (sede) + trámite on
+    the form and submit via envia() — instead of GET-ing the acInfo deep-link,
+    which omits the office and the per-session form token and makes the server
+    return 'no hay citas'. The site re-renders the selection page (selectSede)
+    once with the trámite reset, so re-select and re-submit (loop)."""
+    for attempt in range(3):
+        tramite = driver.find_elements(By.NAME, op_param)
+        if not tramite:
+            return  # advanced past the selection page (instructions / acEntrada)
+        try:
+            sede = driver.find_elements(By.NAME, "sede")
+            if sede:
+                sel = Select(sede[0])
+                try:
+                    sel.select_by_value("99")  # "Cualquier oficina" — widest availability
+                except Exception:
+                    opts = [o.get_attribute("value") for o in sel.options
+                            if o.get_attribute("value") not in ("", "-1")]
+                    if opts:
+                        sel.select_by_value(opts[0])
+            Select(tramite[0]).select_by_value(op_val)
+        except Exception as e:
+            logging.error(f"sede/trámite selection failed: {e}")
+            return
+        time.sleep(random.uniform(0.8, 1.8))
+        try:
+            driver.execute_script("envia();")
+        except Exception:
+            submit_form_resilient(driver, "envia();", BTN_ENTRAR)
+        time.sleep(random.uniform(2, 4))
+        # Dismiss the "Por favor, selecciona un trámite" modal if it appears
+        try:
+            mbtns = driver.find_elements(By.CSS_SELECTOR, ".jconfirm-buttons button")
+            if mbtns:
+                mbtns[0].click()
+                time.sleep(0.6)
+        except Exception:
+            pass
+        if not driver.find_elements(By.NAME, op_param):
+            logging.info(f"Trámite+office submitted (attempt {attempt + 1}); advanced")
+            return
+    logging.warning("Still on selection page after 3 submit attempts")
+
+
 @backoff.on_exception(
     backoff.expo,
     TimeoutException,
@@ -1055,7 +1100,13 @@ def initial_page(
             logging.error(e)
 
     time.sleep(random.uniform(1, 3))  # PAI: pause between navigations
-    driver.get(fast_forward_url2)
+    # PAI: instead of GET-ing the acInfo deep-link (which skips the office and the
+    # per-session form token → "no hay citas"), select office + trámite on the
+    # portada form and submit via envia(), like a human.
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(fast_forward_url2).query)
+    op_param = next(iter(qs.keys()), "tramiteGrupo[1]")
+    op_val = qs.get(op_param, [context.operation_code.value])[0]
+    _select_and_submit_tramite(driver, context, op_param, op_val)
     time.sleep(random.uniform(1.5, 4))
 
     # PAI: detect page state after second navigation
