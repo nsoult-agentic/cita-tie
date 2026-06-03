@@ -1020,16 +1020,9 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
     which omits the office and the per-session form token and makes the server
     return 'no hay citas'. The site re-renders the selection page (selectSede)
     once with the trámite reset, so re-select and re-submit (loop)."""
-    # Verified by manually walking the live site: selecting the office (sede)
-    # fires an onchange that may auto-advance to selectSede. Do it first.
-    try:
-        sede0 = driver.find_elements(By.NAME, "sede")
-        if sede0:
-            Select(sede0[0]).select_by_value("99")  # "Cualquier oficina"
-            time.sleep(random.uniform(1.0, 2.0))
-    except Exception as e:
-        logging.error(f"initial sede select failed: {e}")
-
+    # Select office (sede) + trámite and submit via envia() — the JS submit the
+    # page's own Aceptar button calls. This version advanced cleanly past the
+    # selection page; real-click attempts got intercepted by the header overlay.
     for attempt in range(4):
         tramite = driver.find_elements(By.NAME, op_param)
         if not tramite:
@@ -1039,39 +1032,18 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
             sede = driver.find_elements(By.NAME, "sede")
             if sede:
                 try:
-                    Select(sede[0]).select_by_value("99")
+                    Select(sede[0]).select_by_value("99")  # "Cualquier oficina"
                 except Exception:
                     pass
             Select(tramite[0]).select_by_value(op_val)
         except Exception as e:
             logging.error(f"sede/trámite selection failed: {e}")
             return
-        time.sleep(random.uniform(0.6, 1.4))
-        # Dismiss the cookie bar first — it's a fixed overlay that intercepts clicks.
+        time.sleep(random.uniform(0.8, 1.8))
         try:
-            cb = driver.find_elements(By.ID, "cookie_action_close_header")
-            if cb:
-                cb[0].click()
-                time.sleep(0.3)
+            driver.execute_script("envia();")
         except Exception:
-            pass
-        # Submit: try a real click (scroll to CENTER so the header doesn't obscure
-        # it), and fall back to the JS submit if the click is still intercepted —
-        # so it can never get stuck on the selection page.
-        clicked = False
-        try:
-            btn = driver.find_element(By.ID, "btnAceptar")
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            time.sleep(random.uniform(0.3, 0.7))
-            btn.click()
-            clicked = True
-        except Exception as e:
-            logging.warning(f"btnAceptar click intercepted; falling back to JS submit: {str(e).splitlines()[0]}")
-        if not clicked:
-            try:
-                driver.execute_script("envia();")
-            except Exception:
-                pass
+            submit_form_resilient(driver, "envia();", BTN_ENTRAR)
         time.sleep(random.uniform(2, 4))
         # Dismiss the "Por favor, selecciona un trámite" modal if it appears
         try:
