@@ -906,6 +906,17 @@ def office_selection(driver: webdriver, context: CustomerProfile):
             return True
         elif page_state == PageState.NO_APPOINTMENTS:
             logging.info("No appointments available — starting fresh cycle")
+            # PAI DIAG: capture the EXACT page (screenshot + full rendered HTML +
+            # URL) to settle whether this is a genuine no-citas page (trámite not
+            # registered) or a real availability page being misread.
+            try:
+                ts = dt.now().strftime("%Y%m%d-%H%M%S")
+                driver.save_screenshot(f"/app/data/no-appointments-{ts}.png")
+                with io.open(f"/app/data/no-appointments-{ts}.html", "w", encoding="utf-8") as f:
+                    f.write(driver.page_source or "")
+                logging.info(f"[DIAG:no-appointments] url={driver.current_url} saved no-appointments-{ts}.png/.html")
+            except Exception as e:
+                logging.error(f"[DIAG:no-appointments] capture failed: {e}")
             return None
         elif page_state == PageState.RATE_LIMITED:
             logging.warning("Rate limited during office selection — aborting cycle")

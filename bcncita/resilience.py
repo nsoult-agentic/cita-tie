@@ -159,7 +159,11 @@ _STATE_SIGNALS = {
         "elements": [],
     },
     PageState.SLOT_SELECTION_TABLE: {
-        "text": [("Seleccione una de las siguientes citas", False)],
+        # The live site renders "Selecciona una de las siguientes citas disponibles"
+        # (Selecciona, not Seleccione). Match both spellings + the disponibles phrase.
+        "text": [("Seleccione una de las siguientes citas", False),
+                 ("Selecciona una de las siguientes citas", False),
+                 ("siguientes citas disponibles", False)],
         "title": [],
         "elements": ["CitaMAP_HORAS"],
     },
