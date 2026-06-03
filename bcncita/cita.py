@@ -1020,30 +1020,43 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
     which omits the office and the per-session form token and makes the server
     return 'no hay citas'. The site re-renders the selection page (selectSede)
     once with the trámite reset, so re-select and re-submit (loop)."""
-    for attempt in range(3):
+    # Verified by manually walking the live site: selecting the office (sede)
+    # fires an onchange that may auto-advance to selectSede. Do it first.
+    try:
+        sede0 = driver.find_elements(By.NAME, "sede")
+        if sede0:
+            Select(sede0[0]).select_by_value("99")  # "Cualquier oficina"
+            time.sleep(random.uniform(1.0, 2.0))
+    except Exception as e:
+        logging.error(f"initial sede select failed: {e}")
+
+    for attempt in range(4):
         tramite = driver.find_elements(By.NAME, op_param)
         if not tramite:
-            return  # advanced past the selection page (instructions / acEntrada)
+            logging.info(f"Trámite+office submitted (attempt {attempt}); advanced")
+            return
         try:
             sede = driver.find_elements(By.NAME, "sede")
             if sede:
-                sel = Select(sede[0])
                 try:
-                    sel.select_by_value("99")  # "Cualquier oficina" — widest availability
+                    Select(sede[0]).select_by_value("99")
                 except Exception:
-                    opts = [o.get_attribute("value") for o in sel.options
-                            if o.get_attribute("value") not in ("", "-1")]
-                    if opts:
-                        sel.select_by_value(opts[0])
+                    pass
             Select(tramite[0]).select_by_value(op_val)
         except Exception as e:
             logging.error(f"sede/trámite selection failed: {e}")
             return
-        time.sleep(random.uniform(0.8, 1.8))
+        time.sleep(random.uniform(0.6, 1.4))
+        # REAL trusted click on Aceptar — execute_script('envia()') has no user
+        # gesture and gets flagged by F5 behavioral detection. Verified: real
+        # clicks pass cleanly through selectSede -> acInfo -> acEntrada.
         try:
-            driver.execute_script("envia();")
-        except Exception:
-            submit_form_resilient(driver, "envia();", BTN_ENTRAR)
+            btn = driver.find_element(By.ID, "btnAceptar")
+            driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+            time.sleep(random.uniform(0.3, 0.7))
+            btn.click()
+        except Exception as e:
+            logging.warning(f"btnAceptar real click failed: {e}")
         time.sleep(random.uniform(2, 4))
         # Dismiss the "Por favor, selecciona un trámite" modal if it appears
         try:
@@ -1056,7 +1069,7 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
         if not driver.find_elements(By.NAME, op_param):
             logging.info(f"Trámite+office submitted (attempt {attempt + 1}); advanced")
             return
-    logging.warning("Still on selection page after 3 submit attempts")
+    logging.warning("Still on selection page after 4 submit attempts")
 
 
 @backoff.on_exception(
