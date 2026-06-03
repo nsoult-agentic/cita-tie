@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     fonts-noto-color-emoji \
     xvfb \
+    xauth \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
