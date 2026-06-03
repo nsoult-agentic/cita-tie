@@ -28,12 +28,16 @@ RUN groupadd -g 1200 cita && \
     useradd -u 1200 -g cita -m -d /home/cita -s /bin/false cita && \
     mkdir -p /app/data && chown cita:cita /app/data
 
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
 USER 1200:1200
 
 EXPOSE 8080
 
 LABEL org.opencontainers.image.source=https://github.com/nsoult-agentic/cita-tie
 
-# Run headful under a virtual display (Xvfb) — headless Firefox is a WAF
-# bot-detection signal. xvfb-run -a auto-picks a free display (restart-safe).
-CMD ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", "python", "-u", "run.py"]
+# Headful under an explicit Xvfb display (see entrypoint.sh). Replaces the
+# xvfb-run wrapper, which exited before exec'ing python under cap_drop:ALL +
+# tmpfs /tmp (no /tmp/.X11-unix) — caused empty logs + dead health endpoint.
+CMD ["/usr/local/bin/entrypoint.sh"]

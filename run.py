@@ -283,10 +283,12 @@ def main():
         fingerprint_test()
         return
 
-    profile, ntfy_config = build_profile()
-
+    # Start health server FIRST so the endpoint is observable even if
+    # build_profile() exits or Firefox/Xvfb init fails downstream.
     _stats["start_time"] = time.time()
     _start_health_server(port=int(os.environ.get("SMS_CODE_PORT", "8080")))
+
+    profile, ntfy_config = build_profile()
     cleanup_old_screenshots()
 
     _ntfy(

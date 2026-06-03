@@ -20,7 +20,9 @@ services:
       - /srv/cita-tie/secrets:/secrets:ro
       - /srv/cita-tie/data:/app/data
     tmpfs:
-      - /tmp:size=256m
+      # mode=1777 so UID 1200 can create /tmp/.X11-unix + Firefox temp profiles;
+      # exec so geckodriver/Firefox temp executables aren't blocked by noexec.
+      - /tmp:size=256m,mode=1777,exec
     environment:
       - TZ=Europe/Madrid
       - SECRETS_DIR=/secrets
