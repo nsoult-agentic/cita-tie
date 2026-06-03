@@ -1047,16 +1047,31 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
             logging.error(f"sede/trámite selection failed: {e}")
             return
         time.sleep(random.uniform(0.6, 1.4))
-        # REAL trusted click on Aceptar — execute_script('envia()') has no user
-        # gesture and gets flagged by F5 behavioral detection. Verified: real
-        # clicks pass cleanly through selectSede -> acInfo -> acEntrada.
+        # Dismiss the cookie bar first — it's a fixed overlay that intercepts clicks.
+        try:
+            cb = driver.find_elements(By.ID, "cookie_action_close_header")
+            if cb:
+                cb[0].click()
+                time.sleep(0.3)
+        except Exception:
+            pass
+        # Submit: try a real click (scroll to CENTER so the header doesn't obscure
+        # it), and fall back to the JS submit if the click is still intercepted —
+        # so it can never get stuck on the selection page.
+        clicked = False
         try:
             btn = driver.find_element(By.ID, "btnAceptar")
-            driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             time.sleep(random.uniform(0.3, 0.7))
             btn.click()
+            clicked = True
         except Exception as e:
-            logging.warning(f"btnAceptar real click failed: {e}")
+            logging.warning(f"btnAceptar click intercepted; falling back to JS submit: {str(e).splitlines()[0]}")
+        if not clicked:
+            try:
+                driver.execute_script("envia();")
+            except Exception:
+                pass
         time.sleep(random.uniform(2, 4))
         # Dismiss the "Por favor, selecciona un trámite" modal if it appears
         try:
