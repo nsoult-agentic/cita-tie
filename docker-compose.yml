@@ -4,7 +4,9 @@ services:
     container_name: cita-tie
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8085:8080"
+      # Bind to the NUC's LAN IP so the SMS-code entry page is reachable from
+      # Neil's phone on the LAN (127.0.0.1 was loopback-only — unreachable from a phone).
+      - "172.16.10.25:8085:8080"
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -22,9 +24,18 @@ services:
     environment:
       - TZ=Europe/Madrid
       - SECRETS_DIR=/secrets
-      - OFFICES=BARCELONA,BADALONA,HOSPITALET,CORNELLA,SANTADRIA,BARCELONA_MALLORCA,CASTELLDEFELS,CERDANYOLA,ELPRAT,GRANOLLERS,IGUALADA,MANRESA,MATARO,MONTCADA,RIPOLLET,RUBI,SABADELL,SANTACOLOMA,SANTBOI,SANTCUGAT,SANTFELIU,TERRASSA,VIC,VILADECANS,VILAFRANCA,VILANOVA
+      # OFFICES: leave EMPTY for non-Barcelona provinces. The Office enum only holds
+      # Barcelona-province offices; their value codes can collide with a different
+      # province's dropdown and book an unintended office. Empty => auto-select an
+      # office from the live page. For BARCELONA, restore the comma-separated list.
+      - OFFICES=
       - OPERATION_CODE=TOMA_HUELLAS
+      # Target province. Default BARCELONA (in code). Currently TARRAGONA (has availability).
+      - PROVINCE=TARRAGONA
       - SMS_CODE_PORT=8080
+      # Host-published URL for the SMS-code entry page — must match the published host
+      # port below (8085), NOT the in-container SMS_CODE_PORT. Reachable from the LAN.
+      - SMS_PUBLIC_URL=http://172.16.10.25:8085
       - HOT_CYCLES=12
       # - FINGERPRINT_TEST=1  # uncomment to run fingerprint audit
     healthcheck:

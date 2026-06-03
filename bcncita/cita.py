@@ -977,7 +977,7 @@ def confirm_appointment(driver: webdriver, context: CustomerProfile):
         if context.save_artifacts:
             error_name = f"/app/data/error-{ctime}.png".replace(":", "-")
             driver.save_screenshot(error_name)
-        _ntfy("Booking error", "Unexpected page at confirmation step. Check screenshots.", priority="high", tags="warning")
+        _ntfy("Booking error", f"Unexpected page at confirmation step (state={page_state.name}). Check screenshots.", priority="high", tags="warning")
     return None
 
 
@@ -1184,6 +1184,12 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
             )
         position = find_best_date_slots(driver, context)
         if not position:
+            _ntfy(
+                "Step 4 — slot seen, no bookable date",
+                "Reached the slot page but no date matched filters / slot already taken (likely external).",
+                priority="high",
+                tags="warning",
+            )
             return None
         time.sleep(0.5)
         success = process_captcha(driver, context)
@@ -1246,6 +1252,12 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                         pass
             best_date = find_best_date(sorted(slots), context)
             if not best_date:
+                _ntfy(
+                    "Step 4 — slot seen, no bookable date",
+                    "Reached the slot table but no date matched filters / slot already taken (likely external).",
+                    priority="high",
+                    tags="warning",
+                )
                 return None
             slot = slots[best_date][0]
             time.sleep(0.5)
@@ -1267,6 +1279,15 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
     else:
         logging.info("[Step 4/6] Cita attempt -> missed selection")
         _capture_diagnostics(driver, "cita-missed-selection")
+        # PAI: telemetry — make the (rare) live attempt diagnosable.
+        # NO_APPOINTMENTS / RATE_LIMITED = external (slot gone / WAF).
+        # UNKNOWN = internal (page changed / stale selectors — check the screenshot).
+        _ntfy(
+            "Step 4 — no slot booked",
+            f"Reached cita page, state={page_state.name}. See diag-cita-missed-selection screenshot.",
+            priority="high",
+            tags="warning",
+        )
         return None
 
     resp_text = body_text(driver)
@@ -1303,9 +1324,13 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                 # PAI: SMS needed — wait for code via unified health server in run.py
                 global _sms_code_value
                 sms_port = context.sms_code_port
+                # PAI: the in-container port (sms_port) is NOT the host-published port.
+                # Use SMS_PUBLIC_URL (set in compose) so the link is reachable from a
+                # phone on the LAN, not just localhost on the NUC.
+                sms_url = os.environ.get("SMS_PUBLIC_URL", "http://172.16.10.25:8085").rstrip("/")
                 _ntfy(
                     "SMS CODE NEEDED!",
-                    f"Open http://172.16.10.25:{sms_port}/code to enter the SMS code. You have 5 minutes.",
+                    f"Open {sms_url}/code to enter the SMS code. You have 5 minutes.",
                     priority="urgent",
                     tags="rotating_light,iphone",
                 )
@@ -1338,6 +1363,14 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
             driver.save_screenshot(
                 f"/app/data/failed-confirmation-{dt.now()}.png".replace(":", "-")
             )
+        # PAI: telemetry — slot was submitted but confirmation page not reached.
+        # Slot taken (external) or page changed (internal). State tells which.
+        _ntfy(
+            "Step 5 — confirmation not reached",
+            f"Submitted slot, landed on state={page_state.name}. See diag-missed-confirmation screenshot.",
+            priority="high",
+            tags="warning",
+        )
         return None
 
 

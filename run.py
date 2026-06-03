@@ -197,13 +197,18 @@ def build_profile() -> CustomerProfile:
     op_code = getattr(OperationType, op_code_str, OperationType.TOMA_HUELLAS)
     offices = parse_offices(os.environ.get("OFFICES", ""))
 
+    province_str = os.environ.get("PROVINCE", "BARCELONA").upper()
+    province = getattr(Province, province_str, Province.BARCELONA)
+    if province.name != province_str:
+        log.warning(f"Unknown province '{province_str}' — defaulting to BARCELONA")
+
     profile = CustomerProfile(
         name=profile_data["name"],
         doc_type=doc_type,
         doc_value=profile_data["doc_value"],
         phone=profile_data["phone"],
         email=profile_data["email"],
-        province=Province.BARCELONA,
+        province=province,
         operation_code=op_code,
         country=profile_data["country"],
         offices=offices,
@@ -220,6 +225,7 @@ def build_profile() -> CustomerProfile:
     )
 
     log.info(f"Profile loaded ({profile.doc_type.value}: {profile.doc_value[:3]}***)")
+    log.info(f"Province: {province.name}")
     log.info(f"Operation: {op_code_str}")
     log.info(f"Offices: {[o.name for o in offices] if offices else 'auto-select'}")
     log.info(f"CapMonster: {'enabled' if profile.auto_captcha else 'DISABLED'}")
@@ -285,7 +291,7 @@ def main():
 
     _ntfy(
         "TIE Checker Started",
-        f"Monitoring for {profile.operation_code.name} appointments in Barcelona",
+        f"Monitoring for {profile.operation_code.name} appointments in {profile.province.name.title()}",
         ntfy_config,
         priority="default",
         tags="mag,robot_face",
