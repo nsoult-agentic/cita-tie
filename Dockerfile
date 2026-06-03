@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     firefox-esr \
     fonts-liberation \
     fonts-noto-color-emoji \
+    xvfb \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
@@ -32,4 +33,6 @@ EXPOSE 8080
 
 LABEL org.opencontainers.image.source=https://github.com/nsoult-agentic/cita-tie
 
-CMD ["python", "-u", "run.py"]
+# Run headful under a virtual display (Xvfb) — headless Firefox is a WAF
+# bot-detection signal. xvfb-run -a auto-picks a free display (restart-safe).
+CMD ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", "python", "-u", "run.py"]

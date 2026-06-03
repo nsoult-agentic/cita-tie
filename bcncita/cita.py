@@ -82,20 +82,11 @@ def _classify_result(result, driver):
 def fingerprint_test():
     """Run fingerprint audit against detection sites. Set FINGERPRINT_TEST=1 to activate."""
     logging.info("=== FINGERPRINT TEST MODE ===")
-    options = webdriver.FirefoxOptions()
-    options.add_argument("--headless")
-    options.add_argument("--width=1920")
-    options.add_argument("--height=1080")
-    options.set_preference("dom.webdriver.enabled", False)
-    options.set_preference("useAutomationExtension", False)
-    options.set_preference("intl.accept_languages", "es-ES,es,en")
-    options.set_preference("general.useragent.locale", "es-ES")
-    options.set_preference("dom.confirm_repost.testing.always_accept", True)
-    options.set_preference("toolkit.telemetry.enabled", False)
-    options.set_preference("app.update.enabled", False)
-    options.set_preference("browser.shell.checkDefaultBrowser", False)
+    # PAI: use the SAME hardened options + WebExtension as the booking flow,
+    # so this test actually validates the production fingerprint.
+    options = _stealth_options()
     browser = webdriver.Firefox(options=options)
-    browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    _install_stealth_addon(browser)
 
     try:
         # Test 1: CreepJS
@@ -119,6 +110,18 @@ def fingerprint_test():
         logging.info(f"[FINGERPRINT] navigator.webdriver={webdriver_val}")
         logging.info(f"[FINGERPRINT] navigator.plugins.length={plugins_count}")
         logging.info(f"[FINGERPRINT] userAgent={ua}")
+
+        # Test 3: the REAL F5-protected site — the only test that proves the WAF
+        # accepts us. PASS = booking page renders; FAIL = "requested URL was rejected".
+        logging.info("Navigating to the live ICP+ site (F5 check)...")
+        browser.get("https://icp.administracionelectronica.gob.es/icpplus/citar?p=43&locale=es")
+        time.sleep(8)
+        browser.save_screenshot("/app/data/fingerprint-icp-f5.png")
+        state = detect_page_state(browser)
+        if state == PageState.RATE_LIMITED:
+            logging.error("[FINGERPRINT] F5 CHECK FAILED — still served the WAF rejection page")
+        else:
+            logging.info(f"[FINGERPRINT] F5 CHECK PASSED — page state={state.name} (not RATE_LIMITED)")
     finally:
         browser.quit()
     logging.info("=== FINGERPRINT TEST COMPLETE ===")
@@ -343,22 +346,32 @@ class CustomerProfile:
             assert len(self.offices) == 1, "Indicate office for card pickup"
 
 
-def init_wedriver(context: CustomerProfile):
-    """Initialize headless Firefox — less detectable than Chrome for government sites."""
+def _stealth_options() -> "webdriver.FirefoxOptions":
+    """Shared Firefox options for both the booking flow and fingerprint test.
+
+    Runs HEADFUL under Xvfb (see Dockerfile xvfb-run wrapper) — headless Firefox
+    is a detectable signal class for WAF bot-defense. navigator.webdriver hiding
+    is handled by a document_start WebExtension (install_addon below), NOT by the
+    dom.webdriver.enabled pref (geckodriver overrides it) or a one-shot
+    execute_script (wiped on every navigation, loses the race vs inline detection).
+    """
     options = webdriver.FirefoxOptions()
 
-    # Headless mode
-    options.add_argument("--headless")
+    # PAI: NO --headless. Process runs under xvfb-run, so Firefox is headful
+    # against a virtual display — eliminates the headless-detection category.
     options.add_argument("--width=1920")
     options.add_argument("--height=1080")
 
-    # Anti-detection: disable navigator.webdriver
-    options.set_preference("dom.webdriver.enabled", False)
-    options.set_preference("useAutomationExtension", False)
-
-    # Language preferences — Spanish
+    # Language preferences — Spanish (consistent with a Spain-based applicant)
     options.set_preference("intl.accept_languages", "es-ES,es,en")
     options.set_preference("general.useragent.locale", "es-ES")
+
+    # PAI: present a current desktop Firefox UA instead of leaking the Debian
+    # firefox-esr build string. Platform kept Linux for internal consistency.
+    options.set_preference(
+        "general.useragent.override",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    )
 
     # Download directory
     options.set_preference("browser.download.dir", "/app/data")
@@ -372,25 +385,28 @@ def init_wedriver(context: CustomerProfile):
     options.set_preference("app.update.enabled", False)
     options.set_preference("browser.shell.checkDefaultBrowser", False)
 
-    # PAI: inject webdriver override that persists across navigations
-    # The one-time execute_script approach gets wiped on every page load.
-    # Instead, use an autoconfig script via Firefox preferences.
+    # PAI: removed dom.webdriver.enabled (geckodriver overrides it) and
+    # useAutomationExtension (Chrome-only no-op). webdriver hiding is via the
+    # WebExtension installed in init_wedriver / fingerprint_test.
     options.set_preference("privacy.resistFingerprinting", False)
 
+    return options
+
+
+def _install_stealth_addon(browser: webdriver) -> None:
+    """Load the document_start WebExtension that persistently hides webdriver."""
+    ext_path = os.path.join(os.path.dirname(__file__), "stealth_ext")
+    try:
+        browser.install_addon(ext_path, temporary=True)
+    except Exception as e:
+        logging.warning(f"stealth extension failed to load: {e}")
+
+
+def init_wedriver(context: CustomerProfile):
+    """Initialize headful (Xvfb) Firefox with persistent anti-detection."""
+    options = _stealth_options()
     browser = webdriver.Firefox(options=options)
-
-    # PAI: use execute_cdp_cmd equivalent — inject script into every page context
-    # This overrides navigator.webdriver on every document load via MutationObserver trick
-    browser.execute_script("""
-        // Override for current page
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        // Persist via window proxy — re-inject on every navigation
-        const origGetter = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
-        if (origGetter) {
-            Object.defineProperty(Navigator.prototype, 'webdriver', {get: () => undefined, configurable: true});
-        }
-    """)
-
+    _install_stealth_addon(browser)
     return browser
 
 
