@@ -1072,8 +1072,10 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
 def initial_page(
     driver: webdriver, context: CustomerProfile, fast_forward_url, fast_forward_url2
 ):
-    if context.first_load:
-        driver.delete_all_cookies()
+    # PAI: do NOT wipe cookies. F5 BIG-IP ASM sets trust cookies (TSPD/TS01...)
+    # after its JS challenge. Wiping them every cycle makes each attempt look like
+    # a cold, untrusted client — which is exactly what triggers the
+    # "requested URL was rejected" block on the FIRST attempt.
     driver.set_page_load_timeout(300 if context.first_load else 50)
     time.sleep(1)
     driver.get(fast_forward_url)
@@ -1092,12 +1094,8 @@ def initial_page(
         context.first_load = True
         raise TimeoutException
 
-    if context.first_load:
-        try:
-            driver.execute_script("window.localStorage.clear();")
-            driver.execute_script("window.sessionStorage.clear();")
-        except Exception as e:
-            logging.error(e)
+    # PAI: do NOT clear localStorage/sessionStorage either — F5 ASM challenge
+    # state can live there; clearing it forces a fresh (untrusted) challenge.
 
     time.sleep(random.uniform(1, 3))  # PAI: pause between navigations
     # PAI: instead of GET-ing the acInfo deep-link (which skips the office and the
