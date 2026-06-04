@@ -49,3 +49,28 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+
+  # Long-lived browser — holds the Cl@ve-authenticated Firefox session. The
+  # cita-tie code container connects to it via Remote WebDriver and re-attaches
+  # the session, so redeploying the CODE never restarts the browser (one QR scan
+  # survives code iterations). CI only bumps the cita-tie image line, so GitOps
+  # leaves this service running.
+  cita-browser:
+    image: selenium/standalone-firefox:latest
+    container_name: cita-browser
+    restart: unless-stopped
+    shm_size: 2g
+    ports:
+      - "172.16.10.25:4444:4444"   # WebDriver endpoint (LAN)
+      - "172.16.10.25:7900:7900"   # noVNC — watch the browser / scan the Cl@ve QR
+    environment:
+      - TZ=Europe/Madrid
+      - SE_NODE_SESSION_TIMEOUT=999999999  # do NOT reap our idle Cl@ve session (-1 wrongly dies in 30s)
+      - SE_NODE_MAX_SESSIONS=1
+      - SE_SCREEN_WIDTH=1920
+      - SE_SCREEN_HEIGHT=1080
+    networks:
+      - cita-net
+
+networks:
+  cita-net: {}
