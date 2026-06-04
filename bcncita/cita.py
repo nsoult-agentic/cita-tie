@@ -412,8 +412,118 @@ def _install_stealth_addon(browser: webdriver) -> None:
         logging.warning(f"stealth extension failed to load: {e}")
 
 
+SESSION_FILE = "/app/data/session.json"
+
+
+def _remote_fx_options():
+    """FirefoxOptions for a REMOTE (Grid) session — same anti-detection prefs/UA
+    as the local build, minus the local -profile path (profile lives in the
+    browser container)."""
+    o = webdriver.FirefoxOptions()
+    o.add_argument("--width=1920")
+    o.add_argument("--height=1080")
+    o.set_preference("intl.accept_languages", "es-ES,es,en")
+    o.set_preference("general.useragent.locale", "es-ES")
+    o.set_preference(
+        "general.useragent.override",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    )
+    o.set_preference("dom.confirm_repost.testing.always_accept", True)
+    o.set_preference("toolkit.telemetry.enabled", False)
+    o.set_preference("app.update.enabled", False)
+    o.set_preference("browser.shell.checkDefaultBrowser", False)
+    o.set_preference("privacy.resistFingerprinting", False)
+    return o
+
+
+def _attached_driver(executor, session_id):
+    """Bind to an EXISTING geckodriver session WITHOUT issuing newSession —
+    so we never spawn a second browser (which would destroy the in-memory Cl@ve
+    session)."""
+    from selenium.webdriver.remote.webdriver import WebDriver as _RWD
+
+    class _Attached(_RWD):
+        def start_session(self, capabilities):  # noqa: override — do NOT POST /session
+            self.session_id = session_id
+            self.caps = {}
+
+    return _Attached(command_executor=executor, options=_remote_fx_options())
+
+
+def _session_alive(executor, session_id):
+    try:
+        d = _attached_driver(executor, session_id)
+        _ = d.current_url  # cheap round-trip to the live session
+        return d
+    except Exception as e:
+        logging.warning(f"Saved session not alive: {str(e).splitlines()[0]}")
+        return None
+
+
+def _read_session_file():
+    try:
+        with open(SESSION_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_session_file(executor, session_id):
+    try:
+        with open(SESSION_FILE, "w") as f:
+            json.dump({"executor": executor, "session_id": session_id}, f)
+    except Exception as e:
+        logging.error(f"session file write failed: {e}")
+
+
+def _install_stealth_addon_remote(driver, ext_dir):
+    """Install the webdriver-hide WebExtension over Remote via geckodriver's
+    moz/addon/install endpoint (the local install_addon helper isn't on Remote)."""
+    import base64
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, _dirs, files in os.walk(ext_dir):
+            for fn in files:
+                p = os.path.join(root, fn)
+                z.write(p, os.path.relpath(p, ext_dir))
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    try:
+        driver.command_executor._commands["INSTALL_ADDON"] = (
+            "POST", "/session/$sessionId/moz/addon/install")
+        driver.execute("INSTALL_ADDON", {"addon": b64, "temporary": True})
+        logging.info("Remote stealth addon installed")
+    except Exception as e:
+        logging.warning(f"remote addon install failed: {str(e).splitlines()[0]}")
+
+
 def init_wedriver(context: CustomerProfile):
-    """Initialize headful (Xvfb) Firefox with persistent anti-detection."""
+    """Remote WebDriver against the long-lived cita-browser when WEBDRIVER_URL is
+    set: reattach the saved session (preserving the Cl@ve login across code
+    redeploys) or create a fresh one. Falls back to local headful Firefox otherwise."""
+    url = os.environ.get("WEBDRIVER_URL")
+    if url:
+        saved = _read_session_file()
+        if saved and saved.get("executor") == url and saved.get("session_id"):
+            d = _session_alive(url, saved["session_id"])
+            if d is not None:
+                logging.info(f"Reattached live browser session {saved['session_id']}")
+                return d
+            logging.warning("Saved session dead — creating a fresh remote session")
+        d = webdriver.Remote(command_executor=url, options=_remote_fx_options())
+        _install_stealth_addon_remote(d, os.path.join(os.path.dirname(__file__), "stealth_ext"))
+        _write_session_file(url, d.session_id)
+        logging.info(f"Created fresh remote session {d.session_id} — Cl@ve QR re-scan needed")
+        try:
+            _ntfy("Cl@ve re-scan needed",
+                  "Fresh browser session created — scan the QR (noVNC :7900 or the control flow).",
+                  priority="high", tags="warning")
+        except Exception:
+            pass
+        return d
+
+    # Local fallback (no WEBDRIVER_URL): headful Xvfb Firefox in this container
     options = _stealth_options()
     browser = webdriver.Firefox(options=options)
     _install_stealth_addon(browser)

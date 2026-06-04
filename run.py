@@ -145,12 +145,17 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 ok = fill_personal_info(d, _ctl["profile"])
                 return self._cjson({"ok": bool(ok), "url": d.current_url})
             if cmd == "quit":
-                try:
-                    d.quit()
-                except Exception:
-                    pass
+                # Over Remote, .quit() DELETES the live session (kills the Cl@ve
+                # login). Default: drop only the local reference (reattach later).
+                # Use ?hard=1 to actually end the browser session.
+                hard = q.get("hard", ["0"])[0] == "1"
+                if hard:
+                    try:
+                        d.quit()
+                    except Exception:
+                        pass
                 _ctl["driver"] = None
-                return self._cjson({"ok": True})
+                return self._cjson({"ok": True, "hard": hard})
             if cmd == "solvecaptcha":
                 # Solve the current page's image CAPTCHA via the container's
                 # CapMonster key and RETURN the text (for verification).

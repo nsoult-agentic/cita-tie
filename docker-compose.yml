@@ -42,6 +42,9 @@ services:
       # port below (8085), NOT the in-container SMS_CODE_PORT. Reachable from the LAN.
       - SMS_PUBLIC_URL=http://172.16.10.25:8085
       - HOT_CYCLES=12
+      # Step 2: drive the long-lived cita-browser via Remote WebDriver so code
+      # redeploys reattach the existing (Cl@ve-authed) session instead of restarting it.
+      - WEBDRIVER_URL=http://cita-browser:4444
       # - FINGERPRINT_TEST=1  # uncomment to run fingerprint audit
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/', timeout=5)"]
@@ -49,6 +52,10 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    networks:
+      - cita-net
+    depends_on:
+      - cita-browser
 
   # Long-lived browser — holds the Cl@ve-authenticated Firefox session. The
   # cita-tie code container connects to it via Remote WebDriver and re-attaches
