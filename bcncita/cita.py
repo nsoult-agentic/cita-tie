@@ -182,15 +182,25 @@ def _ntfy(title, message, priority="default", tags=""):
     config = _load_ntfy_config()
     url = config.get("url", "")
     topic = config.get("topic", "")
+    token = config.get("token", "")
     if not url or not topic:
+        logging.warning("ntfy: url/topic not configured in ntfy.json; skipping push")
         return
+    headers = {"Title": title, "Priority": str(priority), "Tags": tags}
+    # The self-hosted ntfy server requires auth to publish (anonymous = HTTP 403).
+    # Send the token from ntfy.json; without it pushes are silently rejected.
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        requests.post(
+        resp = requests.post(
             f"{url}/{topic}",
             data=message.encode("utf-8"),
-            headers={"Title": title, "Priority": priority, "Tags": tags},
+            headers=headers,
             timeout=10,
         )
+        # Don't swallow non-2xx — a 403 (missing/expired token) used to look like success.
+        if resp.status_code >= 300:
+            logging.error(f"ntfy push rejected: HTTP {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         logging.error(f"ntfy send failed: {e}")
 
