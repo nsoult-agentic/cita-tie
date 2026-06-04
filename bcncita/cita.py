@@ -186,7 +186,12 @@ def _ntfy(title, message, priority="default", tags=""):
     if not url or not topic:
         logging.warning("ntfy: url/topic not configured in ntfy.json; skipping push")
         return
-    headers = {"Title": title, "Priority": str(priority), "Tags": tags}
+    # ntfy HTTP headers are encoded latin-1 by requests, so emoji in the Title
+    # (e.g. "🎯 CITA") raises UnicodeEncodeError. Strip non-latin-1 from header
+    # values (Spanish accents survive; emoji is dropped — use Tags for emoji).
+    def _hdr(v):
+        return str(v).encode("latin-1", "ignore").decode("latin-1")
+    headers = {"Title": _hdr(title), "Priority": str(priority), "Tags": _hdr(tags)}
     # The self-hosted ntfy server requires auth to publish (anonymous = HTTP 403).
     # Send the token from ntfy.json; without it pushes are silently rejected.
     if token:
