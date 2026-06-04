@@ -151,6 +151,27 @@ class _HealthHandler(BaseHTTPRequestHandler):
                     pass
                 _ctl["driver"] = None
                 return self._cjson({"ok": True})
+            if cmd == "solvecaptcha":
+                # Solve the current page's image CAPTCHA via the container's
+                # CapMonster key and RETURN the text (for verification).
+                import asyncio
+                import base64 as _b64
+                import requests as _rq
+                from bcncita.cita import _get_capmonster_client, CAPTCHA_IMAGE
+                from bcncita.resilience import find_elements_resilient
+                from capmonstercloudclient.requests import ImageToTextRequest
+                imgs = find_elements_resilient(d, CAPTCHA_IMAGE)
+                if not imgs:
+                    return self._cjson({"error": "no captcha image on page"}, 404)
+                src = imgs[0].get_attribute("src") or ""
+                if src.startswith("data:"):
+                    img_data = src.split(",", 1)[1].strip()
+                else:
+                    img_data = _b64.b64encode(_rq.get(src, timeout=10).content).decode()
+                client = _get_capmonster_client(_ctl["profile"])
+                resp = asyncio.run(client.solve_captcha(ImageToTextRequest(body=img_data)))
+                return self._cjson({"text": resp.get("text", ""),
+                                    "src_type": "data" if src.startswith("data:") else "url"})
             return self._cjson({"error": "unknown command: %s" % cmd}, 404)
         except Exception as e:
             return self._cjson({"error": str(e).splitlines()[0] if str(e) else type(e).__name__}, 500)
