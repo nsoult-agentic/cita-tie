@@ -177,6 +177,13 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 resp = asyncio.run(client.solve_captcha(ImageToTextRequest(body=img_data)))
                 return self._cjson({"text": resp.get("text", ""),
                                     "src_type": "data" if src.startswith("data:") else "url"})
+            if cmd == "ntfy":
+                # Send a push via the container's ntfy.json (works from the Bash
+                # watchers: curl /control/ntfy?title=&msg=&priority=&tags=).
+                from bcncita.cita import _ntfy
+                _ntfy(q.get("title", ["cita-tie"])[0], q.get("msg", [""])[0],
+                      priority=q.get("priority", ["default"])[0], tags=q.get("tags", [""])[0])
+                return self._cjson({"ok": True})
             return self._cjson({"error": "unknown command: %s" % cmd}, 404)
         except Exception as e:
             return self._cjson({"error": str(e).splitlines()[0] if str(e) else type(e).__name__}, 500)
