@@ -357,6 +357,16 @@ def _stealth_options() -> "webdriver.FirefoxOptions":
     """
     options = webdriver.FirefoxOptions()
 
+    # PAI: PERSISTENT profile on the /app/data volume (a host bind mount) so
+    # cookies — including the long-lived Cl@ve gateway SSO — survive container
+    # restarts. Avoids re-scanning the QR after every redeploy.
+    try:
+        os.makedirs("/app/data/ffprofile", exist_ok=True)
+    except Exception:
+        pass
+    options.add_argument("-profile")
+    options.add_argument("/app/data/ffprofile")
+
     # PAI: NO --headless. Process runs under xvfb-run, so Firefox is headful
     # against a virtual display — eliminates the headless-detection category.
     options.add_argument("--width=1920")
