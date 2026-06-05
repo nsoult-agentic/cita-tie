@@ -283,6 +283,33 @@ def detect_page_state(driver: WebDriver, body_text_cache: str = None) -> PageSta
     return PageState.UNKNOWN
 
 
+# ── F5 self-heal ────────────────────────────────────────────────────
+
+def clear_icp_cookies(driver: WebDriver) -> int:
+    """Delete ONLY the icp.administracionelectronica.gob.es domain cookies.
+
+    Rationale: F5 BIG-IP ASM pins its "Request Rejected" block to a cookie on the
+    icp domain. Clearing that domain's cookies lets the next cycle present a clean
+    client. We deliberately do NOT wipe everything — the warm Cl@ve SSO session
+    lives on clave.gob.es cookies, which must survive. Must be called while the
+    browser is on an icp.administracionelectronica.gob.es page (cookies are
+    domain-scoped to the current document).
+    """
+    cleared = 0
+    try:
+        for c in driver.get_cookies():
+            if "administracionelectronica" in c.get("domain", ""):
+                try:
+                    driver.delete_cookie(c["name"])
+                    cleared += 1
+                except Exception:
+                    continue
+    except Exception as e:
+        log.warning(f"clear_icp_cookies failed: {e}")
+    log.info(f"clear_icp_cookies: deleted {cleared} icp-domain cookie(s)")
+    return cleared
+
+
 # ── Form Submission ─────────────────────────────────────────────────
 
 def submit_form_resilient(driver: WebDriver, js_function: str, fallback_descriptor=None) -> bool:

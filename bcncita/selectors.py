@@ -98,6 +98,39 @@ BTN_CONSULTAR = ElementDescriptor(
     required=False,
 )
 
+# ── con-Cl@ve (authenticated) path ──────────────────────────────────
+
+# acInfo page: "Presentación con Cl@ve" button. It is a JS-bound <div>
+# (no inline onclick), so it MUST be clicked with a real Selenium .click().
+BTN_ACCESO_CLAVE = ElementDescriptor(
+    name="btn_acceso_clave",
+    strategies=[
+        (By.ID, "btnAccesoClave"),
+        (By.CSS_SELECTOR, "[id*='AccesoClave']"),
+        (By.XPATH, "//*[contains(text(),'con Cl@ve') or contains(text(),'con Clave')]"),
+    ],
+)
+
+# acEntrada page: "Copiar" button — autofills NIE + name from the Cl@ve identity.
+BTN_COPIAR = ElementDescriptor(
+    name="btn_copiar",
+    strategies=[
+        (By.ID, "btnCopiar"),
+        (By.CSS_SELECTOR, "[id*='Copiar']"),
+        (By.XPATH, "//*[contains(@value,'Copiar') or contains(text(),'Copiar')]"),
+    ],
+)
+
+# pasarela.clave.gob.es gateway: the "Cl@ve Móvil / IdP_MOVIL" identity-provider button.
+IDP_MOVIL_BUTTON = ElementDescriptor(
+    name="idp_movil_button",
+    strategies=[
+        (By.XPATH, "//button[contains(@onclick,'IDP_MOVIL')]"),
+        (By.XPATH, "//*[contains(@onclick,'IDP_MOVIL')]"),
+    ],
+    required=False,
+)
+
 BTN_SIGUIENTE = ElementDescriptor(
     name="btn_siguiente",
     strategies=[

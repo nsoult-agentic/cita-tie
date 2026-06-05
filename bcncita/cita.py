@@ -40,6 +40,7 @@ from .resilience import (
     find_elements_resilient,
     detect_page_state,
     submit_form_resilient,
+    clear_icp_cookies,
     PageState,
     StepError,
     get_fallback_report,
@@ -898,6 +899,30 @@ def find_best_date(dates, context: CustomerProfile):
     return None
 
 
+# PAI: office-proximity ranking for the con-Cl@ve offer page. When multiple citas
+# share the same (earliest) date+time, prefer the office geographically closest to
+# Sant Joan Despí (Baix Llobregat). Lower rank index = closer.
+_OFFICE_PROXIMITY = [
+    "CORNELLA", "SANT FELIU", "SANT JOAN DESPI", "ESPLUGUES", "SANT JUST",
+    "EL PRAT", "HOSPITALET", "SANT BOI", "VILADECANS", "BARCELONA",
+    "BADALONA", "SANTA COLOMA", "CASTELLDEFELS", "CERDANYOLA", "MATARO",
+    "GRANOLLERS",
+]
+
+
+def office_proximity_rank(office_label: str) -> int:
+    """Return a proximity rank for an office label (lower = closer to Sant Joan
+    Despí). Case-insensitive substring match against _OFFICE_PROXIMITY; unknown
+    offices get a large rank so they sort last."""
+    if not office_label:
+        return 9999
+    up = office_label.upper()
+    for idx, kw in enumerate(_OFFICE_PROXIMITY):
+        if kw in up:
+            return idx
+    return 9999
+
+
 def select_office(driver: webdriver, context: CustomerProfile):
     if not context.auto_office:
         logging.info("auto_office disabled — skipping office selection")
@@ -1290,95 +1315,207 @@ def initial_page(
     context._rate_limit_count = 0  # Reset on success
 
 
+def _real_click(driver: webdriver, el) -> None:
+    """Scroll into view + real Selenium .click(); fall back to JS click only on failure.
+    Several con-Cl@ve buttons (btnAccesoClave, btnCopiar, IdP-Móvil) are JS-bound
+    divs/buttons with NO inline onclick — JS-submit (envia()) does NOT trigger them,
+    so a REAL element click is required."""
+    try:
+        driver.execute_script("arguments[0].scrollIntoView(true);", el)
+        time.sleep(0.3)
+        el.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", el)
+
+
+def _handle_rate_limit(driver: webdriver, context: CustomerProfile, resp_text: str, where: str):
+    """Self-heal for the two distinct block pages detect_page_state lumps into
+    RATE_LIMITED. Returns None always (caller should return it to retry next cycle).
+      - F5 ("Request Rejected" / "support id"): block is cookie-pinned on the icp
+        domain. Delete ONLY icp cookies (preserves the Cl@ve SSO on clave.gob.es)
+        and retry immediately — do NOT long-sleep.
+      - HTTP 429 ("Too Many Requests"): genuine throttle → exponential backoff sleep.
+    """
+    low = (resp_text or "").lower()
+    if ("request rejected" in low) or ("support id" in low) or ("requested url was rejected" in low):
+        logging.warning(f"F5 block detected ({where}) — clearing icp-domain cookies, retry next cycle")
+        _capture_diagnostics(driver, f"f5-block-{where}", context.save_artifacts)
+        clear_icp_cookies(driver)
+        return None
+    # Otherwise treat as HTTP 429 throttle — exponential backoff (base ~120s, cap ~600s).
+    _rate_limit_count = getattr(context, "_rate_limit_count", 0) + 1
+    context._rate_limit_count = _rate_limit_count
+    wait_sec = int(min(120 * (2 ** (_rate_limit_count - 1)), 600) + random.uniform(0, 60))
+    logging.warning(f"429 Too Many Requests ({where}) — hit #{_rate_limit_count}, sleeping {wait_sec}s")
+    _capture_diagnostics(driver, f"rate-limited-{where}", context.save_artifacts)
+    time.sleep(wait_sec)
+    context.first_load = True
+    return None
+
+
 def cycle_cita(
     driver: webdriver, context: CustomerProfile, fast_forward_url, fast_forward_url2
 ):
+    """con-Cl@ve (authenticated) flow. The sin-Cl@ve path (btnEntrar →
+    fill_personal_info → office_selection → phone_mail) is always empty, so we use
+    the warm Cl@ve SSO session held by the long-lived cita-browser instead.
+
+    Flow (every selector verified live on the Barcelona TOMA_HUELLAS trámite):
+      portada → acInfo → [btnAccesoClave] → (pasarela.clave.gob.es?) → acEntrada
+      → [btnCopiar] + set country → [btnEnviar] → acValidarEntrada → [btnEnviar]
+      → acCitar → classify (no citas / offer page → cita_selection).
+    """
+    # initial_page navigates the portada (sede=99 + tramiteGrupo[0]=4010, envia())
+    # and lands on acInfo (PageState.INSTRUCTIONS — has btnEntrar + btnAccesoClave).
     initial_page(driver, context, fast_forward_url, fast_forward_url2)
 
-    btn = find_element_resilient(driver, BTN_ENTRAR, timeout=DELAY)
-    if not btn:
-        logging.error("Timed out waiting for Instructions page to load")
-        _capture_diagnostics(driver, "entrar-not-found", context.save_artifacts)
+    # ── Step 3: acInfo — click "Presentación con Cl@ve" (NOT btnEntrar/sin-Cl@ve) ──
+    clave_btn = find_element_resilient(driver, BTN_ACCESO_CLAVE, timeout=DELAY)
+    if not clave_btn:
+        logging.error("Timed out waiting for acInfo (btnAccesoClave) to load")
+        _capture_diagnostics(driver, "acceso-clave-not-found", context.save_artifacts)
         return None
 
     if os.environ.get("CITA_TEST") and context.operation_code == OperationType.TOMA_HUELLAS:
-        logging.info("Instructions page loaded")
+        logging.info("acInfo page loaded (con-Cl@ve button present)")
         return True
 
-    # Wait for clickable, scroll into view, then click
+    logging.info("[con-Cl@ve 1] acInfo — clicking 'Presentación con Cl@ve'")
+    # Real click required: btnAccesoClave is a JS-bound div with no inline onclick.
+    _real_click(driver, clave_btn)
+    time.sleep(random.uniform(1.5, 3))
+
+    # ── Step 4: Cl@ve gateway (pasarela.clave.gob.es) — may be skipped on warm SSO ──
     try:
-        WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, btn.get_attribute("id") or "btnEntrar")))
-        driver.execute_script("arguments[0].scrollIntoView(true);", btn)
-        time.sleep(0.3)
-        btn.click()
+        cur_url = driver.current_url or ""
     except Exception:
-        # Fallback: JS click bypasses overlay/visibility issues
-        driver.execute_script("arguments[0].click();", btn)
-    logging.info("[Step 1/6] Personal info")
-
-    # PAI: check page state before filling form — WAF may have blocked this navigation
-    time.sleep(1)
-    page_state = detect_page_state(driver)
-    if page_state == PageState.RATE_LIMITED:
-        logging.warning("Rate limited after Entrar click — aborting cycle")
-        _capture_diagnostics(driver, "rate-limited-after-entrar", context.save_artifacts)
-        _rate_limit_count = getattr(context, '_rate_limit_count', 0) + 1
-        context._rate_limit_count = _rate_limit_count
-        wait_min = min(5 * _rate_limit_count, 20)
-        wait_sec = int(wait_min * 60 + random.uniform(0, 60))
-        logging.warning(f"Rate limited (hit #{_rate_limit_count}) — sleeping {wait_sec}s ({wait_min}+ min)")
-        time.sleep(wait_sec)
-        context.first_load = True
-        return None
-    if page_state == PageState.INITIAL_LANDING:
-        logging.warning("Bounced back to landing page after Entrar — session dead")
-        _capture_diagnostics(driver, "session-reset-after-entrar", context.save_artifacts)
-        return None
-
-    success = fill_personal_info(driver, context)
-    if not success:
-        return None
-
-    time.sleep(0.5)
-    enviar_btn = find_element_resilient(driver, BTN_ENVIAR)
-    if enviar_btn:
+        cur_url = ""
+    if "pasarela.clave.gob.es" in cur_url:
+        logging.info("[con-Cl@ve 2] On Cl@ve gateway — selecting Cl@ve Móvil (IDP_MOVIL)")
+        idp_btn = find_element_resilient(driver, IDP_MOVIL_BUTTON, timeout=DELAY)
+        if idp_btn:
+            _real_click(driver, idp_btn)
+            time.sleep(random.uniform(1.5, 3))
         try:
-            driver.execute_script("arguments[0].scrollIntoView(true);", enviar_btn)
-            time.sleep(0.3)
-            enviar_btn.click()
+            cur_url = driver.current_url or ""
         except Exception:
-            driver.execute_script("arguments[0].click();", enviar_btn)
-    else:
-        logging.error("Could not find enviar button")
-        _capture_diagnostics(driver, "enviar-missing", context.save_artifacts)
+            cur_url = ""
+        # Still on the gateway → the warm Cl@ve SSO session has expired.
+        if "pasarela.clave.gob.es" in cur_url:
+            logging.error("CLAVE_AUTH_NEEDED — still on pasarela.clave.gob.es after IdP-Móvil")
+            _capture_diagnostics(driver, "clave-auth-needed", context.save_artifacts)
+            _ntfy(
+                "Cl@ve re-scan needed",
+                "The warm Cl@ve session expired. Re-authenticate via noVNC at "
+                "172.16.10.25:7900, then the bot can resume.",
+                priority="urgent",
+                tags="lock",
+            )
+            return None
+
+    # ── F5 / 429 self-heal check after the Cl@ve hop ──
+    resp_text = body_text(driver)
+    if detect_page_state(driver, resp_text) == PageState.RATE_LIMITED:
+        return _handle_rate_limit(driver, context, resp_text, "post-clave")
+
+    # ── Step 5: acEntrada — copy identity, set country, submit ──
+    # acEntrada is PageState.PERSONAL_INFO (title "Rellene los campos...", #txtIdCitado).
+    copiar_btn = find_element_resilient(driver, BTN_COPIAR, timeout=DELAY)
+    if not copiar_btn:
+        logging.error("Timed out waiting for acEntrada (btnCopiar) to load")
+        _capture_diagnostics(driver, "copiar-not-found", context.save_artifacts)
         return None
+    logging.info("[con-Cl@ve 3] acEntrada — clicking Copiar (autofill NIE + name)")
+    _real_click(driver, copiar_btn)  # real click — autofills from the Cl@ve identity
+    time.sleep(random.uniform(0.8, 1.5))
 
-    # Handle acValidarEntrada intermediate page if present
-    time.sleep(1)
-    validation_result = handle_validation_page(driver, context)
-    if validation_result is None:
-        return None
-
-    # Wait for Solicitar page (non-required element, short timeout)
-    find_element_resilient(driver, BTN_CONSULTAR, timeout=7)
-
+    # txtPaisNac is a <select> hidden behind a custom span → set via JS + change event.
+    # Use the context country code if it maps to a value; default 224 (EEUU).
+    country_value = "224"
     try:
-        wait_exact_time(driver, context)
-    except TimeoutException:
-        logging.error("Timed out waiting for exact time")
-        _capture_diagnostics(driver, "exact-time-timeout", context.save_artifacts)
-        return None
+        country_el = find_element_resilient(driver, COUNTRY_SELECT, timeout=5)
+        if country_el:
+            driver.execute_script(
+                "arguments[0].value = arguments[1];"
+                "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+                country_el, country_value,
+            )
+            logging.info(f"[con-Cl@ve 3] Country set via JS to value={country_value}")
+        else:
+            logging.warning("acEntrada country select not found — proceeding without it")
+    except Exception as e:
+        logging.warning(f"Country set failed: {str(e).split(chr(10))[0]}")
 
-    selection_result = office_selection(driver, context)
-    if selection_result is None:
+    enviar_btn = find_element_resilient(driver, BTN_ENVIAR, timeout=DELAY)
+    if not enviar_btn:
+        logging.error("Could not find Enviar button on acEntrada")
+        _capture_diagnostics(driver, "acentrada-enviar-missing", context.save_artifacts)
         return None
+    logging.info("[con-Cl@ve 3] acEntrada — clicking Enviar (envia())")
+    _real_click(driver, enviar_btn)  # real click; its onclick is envia()
+    time.sleep(random.uniform(1, 2.5))
 
-    return phone_mail(driver, context)
+    # ── Step 6: acValidarEntrada — "Solicitar Cita" (btnEnviar → enviar('solicitud')) ──
+    resp_text = body_text(driver)
+    page_state = detect_page_state(driver, resp_text)
+    if page_state == PageState.RATE_LIMITED:
+        return _handle_rate_limit(driver, context, resp_text, "acvalidar")
+    if page_state == PageState.VALIDATION_PAGE:
+        logging.info("[con-Cl@ve 4] acValidarEntrada — clicking Solicitar Cita")
+        valid_btn = find_element_resilient(driver, BTN_ENVIAR, timeout=DELAY)
+        if not valid_btn:
+            logging.error("Could not find Solicitar Cita button on acValidarEntrada")
+            _capture_diagnostics(driver, "acvalidar-enviar-missing", context.save_artifacts)
+            return None
+        _real_click(driver, valid_btn)  # real click; onclick is enviar('solicitud')
+        time.sleep(random.uniform(1, 2.5))
+    else:
+        logging.warning(f"Expected acValidarEntrada, got {page_state.name} — continuing to classify acCitar")
+
+    # ── Step 7: acCitar — classify outcome ──
+    resp_text = body_text(driver)
+    page_state = detect_page_state(driver, resp_text)
+
+    if page_state == PageState.RATE_LIMITED:
+        return _handle_rate_limit(driver, context, resp_text, "accitar")
+    if page_state == PageState.NO_APPOINTMENTS:
+        logging.info("[con-Cl@ve 5] acCitar — no hay citas disponibles this cycle")
+        context._rate_limit_count = 0  # clean cycle reached the citas page
+        return None
+    if page_state in (PageState.SLOT_SELECTION_TABLE, PageState.SLOT_SELECTION_5MIN):
+        logging.info(f"[con-Cl@ve 5] acCitar — OFFER PAGE ({page_state.name})! Handing off to cita_selection")
+        context._rate_limit_count = 0
+        return cita_selection(driver, context)
+
+    # Anything else is unexpected — capture it so we can refine.
+    logging.warning(f"[con-Cl@ve 5] acCitar — unexpected state {page_state.name}")
+    _capture_diagnostics(driver, "accitar-unexpected", context.save_artifacts)
+    return None
+
+
+def _log_offer_dom(driver: webdriver):
+    """PAI: we have NEVER captured a populated offer page. Log the raw offer-page
+    DOM (slot table outerHTML if present, else first ~8000 chars of page_source)
+    at INFO so the slot/office parser can be refined against real markup."""
+    try:
+        table = driver.find_elements(By.CSS_SELECTOR, "#CitaMAP_HORAS")
+        if table:
+            html = table[0].get_attribute("outerHTML") or ""
+            logging.info(f"[OFFER-DOM] CitaMAP_HORAS outerHTML (first 8000):\n{html[:8000]}")
+        else:
+            src = driver.page_source or ""
+            logging.info(f"[OFFER-DOM] page_source (first 8000):\n{src[:8000]}")
+    except Exception as e:
+        logging.error(f"[OFFER-DOM] capture failed: {str(e).split(chr(10))[0]}")
 
 
 def cita_selection(driver: webdriver, context: CustomerProfile):
     resp_text = body_text(driver)
     page_state = detect_page_state(driver, resp_text)
+
+    # PAI: dump the raw offer DOM before selecting (offer page is unverified).
+    if page_state in (PageState.SLOT_SELECTION_5MIN, PageState.SLOT_SELECTION_TABLE):
+        _log_offer_dom(driver)
 
     if page_state == PageState.SLOT_SELECTION_5MIN:
         logging.info("[Step 4/6] Cita attempt -> selection hit!")
@@ -1436,7 +1573,12 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
         try:
             date_els = find_elements_resilient(driver, SLOT_TABLE_HEADERS)
             dates = sorted([*map(lambda x: x.text, date_els)])
+            # slots: date -> first hueco id (kept for date selection, as before).
             slots: Dict[str, list] = {}
+            # candidates: list of dicts for soonest-then-closest ranking. Each entry
+            # carries the date/time and any office text we can scrape per slot so the
+            # same date+time tiebreak can prefer the office nearest Sant Joan Despí.
+            candidates: list = []
             slot_table_el = find_element_resilient(driver, SLOT_TABLE)
             if not slot_table_el:
                 logging.error("Could not find slot table")
@@ -1452,13 +1594,32 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                         break
                 for idx, cell in enumerate(row.find_elements(By.TAG_NAME, "td")):
                     try:
-                        if slots.get(dates[idx]):
-                            continue
                         hueco_els = cell.find_elements(By.CSS_SELECTOR, "[id^=HUECO]")
                         if not hueco_els:
                             continue
                         slot = hueco_els[0].get_attribute("id")
-                        slots[dates[idx]] = [slot]
+                        slot_date = dates[idx]
+                        # Office text is UNVERIFIED on the live offer page. Best-effort:
+                        # the hueco element's title/text often carries the office name.
+                        office_text = ""
+                        try:
+                            office_text = (
+                                hueco_els[0].get_attribute("title")
+                                or hueco_els[0].text
+                                or cell.text
+                                or ""
+                            )
+                        except Exception:
+                            office_text = ""
+                        candidates.append({
+                            "date": slot_date,
+                            "time": appt_time,
+                            "slot": slot,
+                            "office": office_text,
+                        })
+                        # Preserve prior behaviour: first hueco per date for find_best_date.
+                        if not slots.get(slot_date):
+                            slots[slot_date] = [slot]
                     except Exception:
                         pass
             best_date = find_best_date(sorted(slots), context)
@@ -1470,7 +1631,25 @@ def cita_selection(driver: webdriver, context: CustomerProfile):
                     tags="warning",
                 )
                 return None
-            slot = slots[best_date][0]
+            # PAI: rank the candidates ON the chosen (soonest) date.
+            # PRIMARY = earliest time; TIEBREAK = office closest to Sant Joan Despí.
+            day_cands = [c for c in candidates if c["date"] == best_date]
+            slot = slots[best_date][0]  # safe default
+            if day_cands:
+                offices_seen = any(office_proximity_rank(c["office"]) != 9999 for c in day_cands)
+                if not offices_seen:
+                    logging.info(
+                        "[RANK] No parseable office text per slot — office tiebreak SKIPPED, "
+                        "falling back to soonest-time on soonest-date."
+                    )
+                day_cands.sort(key=lambda c: (c["time"], office_proximity_rank(c["office"])))
+                chosen = day_cands[0]
+                slot = chosen["slot"]
+                logging.info(
+                    f"[RANK] Chosen slot: date={chosen['date']} time={chosen['time']} "
+                    f"office='{chosen['office']}' (rank={office_proximity_rank(chosen['office'])}) "
+                    f"id={slot}"
+                )
             time.sleep(0.5)
             success = process_captcha(driver, context)
             if not success:
