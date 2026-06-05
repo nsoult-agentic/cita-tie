@@ -633,6 +633,12 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
             )
             break
 
+        # PAI: gentle inter-cycle pacing. Back-to-back con-Cl@ve walks (~8 gov
+        # requests each) trip the F5 "Request Rejected" WAF; ~60-90s spacing kept
+        # the host poller clean for hours. Skip after the last cycle.
+        if i < cycles - 1:
+            time.sleep(random.uniform(55, 90))
+
     if not success:
         logging.error("FAIL - all cycles exhausted")
         # PAI: no ntfy here — the scheduler in run.py handles retry notifications
