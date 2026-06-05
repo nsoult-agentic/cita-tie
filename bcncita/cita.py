@@ -1465,8 +1465,15 @@ def cycle_cita(
         logging.error("Could not find Enviar button on acEntrada")
         _capture_diagnostics(driver, "acentrada-enviar-missing", context.save_artifacts)
         return None
-    logging.info("[con-Cl@ve 3] acEntrada — clicking Enviar (envia())")
-    _real_click(driver, enviar_btn)  # real click; its onclick is envia()
+    logging.info("[con-Cl@ve 3] acEntrada — submitting via envia() JS")
+    # Submit via the page's own JS function, NOT a Selenium .click(). A synthetic
+    # click carries isTrusted=false, which F5's client-side f5_cspm flags → the
+    # "Request Rejected" at acValidarEntrada. The host poller used envia() and never
+    # got blocked here. Fall back to a real click only if the JS call fails.
+    try:
+        driver.execute_script("envia();")
+    except Exception:
+        _real_click(driver, enviar_btn)
     time.sleep(random.uniform(1, 2.5))
 
     # ── Step 6: acValidarEntrada — "Solicitar Cita" (btnEnviar → enviar('solicitud')) ──
@@ -1481,7 +1488,10 @@ def cycle_cita(
             logging.error("Could not find Solicitar Cita button on acValidarEntrada")
             _capture_diagnostics(driver, "acvalidar-enviar-missing", context.save_artifacts)
             return None
-        _real_click(driver, valid_btn)  # real click; onclick is enviar('solicitud')
+        try:
+            driver.execute_script("enviar('solicitud');")  # JS, not a synthetic click (see above)
+        except Exception:
+            _real_click(driver, valid_btn)
         time.sleep(random.uniform(1, 2.5))
     else:
         logging.warning(f"Expected acValidarEntrada, got {page_state.name} — continuing to classify acCitar")
