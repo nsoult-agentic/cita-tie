@@ -1437,7 +1437,7 @@ def cycle_cita(
         return None
     logging.info("[con-Cl@ve 3] acEntrada — clicking Copiar (autofill NIE + name)")
     _real_click(driver, copiar_btn)  # real click — autofills from the Cl@ve identity
-    time.sleep(random.uniform(0.8, 1.5))
+    time.sleep(random.uniform(2.5, 4.5))  # human pause: review the autofilled form
 
     # txtPaisNac is a <select> hidden behind a custom span → set via JS + change event.
     # Use the context country code if it maps to a value; default 224 (EEUU).
@@ -1456,6 +1456,10 @@ def cycle_cita(
     except Exception as e:
         logging.warning(f"Country set failed: {str(e).split(chr(10))[0]}")
 
+    # Human pause before submitting. Filling + submitting acEntrada in <2s is the
+    # signature that trips the F5 WAF at the next page (acValidarEntrada) — every
+    # cycle that machine-gunned this transition got "Request Rejected".
+    time.sleep(random.uniform(2.5, 4.5))
     enviar_btn = find_element_resilient(driver, BTN_ENVIAR, timeout=DELAY)
     if not enviar_btn:
         logging.error("Could not find Enviar button on acEntrada")
