@@ -644,11 +644,15 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
         _ntfy("Fallback selectors used", report, priority="low", tags="mag")
     reset_fallback_tracking()
 
-    # PAI: always quit driver, never os._exit
-    try:
-        driver.quit()
-    except Exception:
-        pass
+    # PAI: do NOT quit a reattached REMOTE session — quit() ends the Selenium
+    # session and kills the warm Cl@ve browser, forcing a QR re-scan. Only quit a
+    # locally-spawned Firefox. In remote/reattach mode (WEBDRIVER_URL set) the
+    # long-lived cita-browser session must persist across try_cita() calls.
+    if not os.environ.get("WEBDRIVER_URL"):
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
     return success
 
