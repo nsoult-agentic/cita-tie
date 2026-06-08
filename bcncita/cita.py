@@ -590,6 +590,7 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
     success = False
     result = None
     for i in range(cycles):
+        result = None  # reset per iteration — a TimeoutException must not reuse a stale result
         try:
             _ = driver.title
         except Exception:
@@ -1400,31 +1401,66 @@ def cycle_cita(
         cur_url = driver.current_url or ""
     except Exception:
         cur_url = ""
+    post_clave_text = None
     if "pasarela.clave.gob.es" in cur_url:
         logging.info("[con-Cl@ve 2] On Cl@ve gateway — selecting Cl@ve Móvil (IDP_MOVIL)")
         idp_btn = find_element_resilient(driver, IDP_MOVIL_BUTTON, timeout=DELAY)
         if idp_btn:
             _real_click(driver, idp_btn)
-            time.sleep(random.uniform(1.5, 3))
+
+        # A VALID SSO re-auths SILENTLY via the clave.gob.es cookie: gateway → IdP →
+        # redirect back to ICP. That SAML round-trip routinely takes >3s. WAIT for the
+        # URL to actually LEAVE the gateway before judging — the old fixed 1.5–3s sleep
+        # + one-shot check fired false "re-scan needed" pushes when the redirect just
+        # hadn't landed yet. Catch ANY exception: current_url can raise (not only
+        # TimeoutException) mid-redirect; the bare except keeps this cycle's anti-F5
+        # pacing intact instead of bubbling to start_with's `continue` (which skips it).
+        try:
+            WebDriverWait(driver, 20).until(
+                lambda d: "pasarela.clave.gob.es" not in (d.current_url or "")
+            )
+        except Exception:
+            pass
         try:
             cur_url = driver.current_url or ""
         except Exception:
             cur_url = ""
-        # Still on the gateway → the warm Cl@ve SSO session has expired.
-        if "pasarela.clave.gob.es" in cur_url:
-            logging.error("CLAVE_AUTH_NEEDED — still on pasarela.clave.gob.es after IdP-Móvil")
+
+        # Judge whether Cl@ve actually carried us through. Two RETRYABLE stuck signals:
+        #   (a) still on pasarela.clave.gob.es after the wait, or
+        #   (b) the gateway's SAML error page ("no coincide el RelayState" /
+        #       "Error al validar el certificado").
+        # A single stuck cycle (slow redirect / one-off hiccup) must NOT page; but a
+        # PERSISTENTLY broken/expired gateway MUST — so count CONSECUTIVE stuck cycles
+        # across BOTH signals and alert at the threshold. (post_clave_text is reused by
+        # the F5/429 check below to avoid a redundant body_text read.)
+        post_clave_text = body_text(driver)
+        low = (post_clave_text or "").lower()
+        on_gateway = "pasarela.clave.gob.es" in cur_url
+        saml_error = ("relaystate" in low) or ("error al validar el certificado" in low)
+        if on_gateway or saml_error:
+            stuck = getattr(context, "_clave_stuck_count", 0) + 1
+            context._clave_stuck_count = stuck
+            reason = "still on gateway" if on_gateway else "gateway SAML/cert error"
+            logging.warning(f"Cl@ve not through ({reason}) — stuck #{stuck}, retry next cycle")
             _capture_diagnostics(driver, "clave-auth-needed", context.save_artifacts)
-            _ntfy(
-                "Cl@ve re-scan needed",
-                "The warm Cl@ve session expired. Re-authenticate via noVNC at "
-                "172.16.10.25:7900, then the bot can resume.",
-                priority="urgent",
-                tags="lock",
-            )
+            if stuck >= 3:
+                _ntfy(
+                    "Cl@ve re-scan needed",
+                    "Cl@ve looks expired (stuck on the gateway 3 cycles). "
+                    "Re-authenticate via noVNC at 172.16.10.25:7900, then the bot resumes.",
+                    priority="urgent",
+                    tags="lock",
+                )
             return None
+        # Cl@ve carried through → SSO is alive; clear the stuck counter.
+        context._clave_stuck_count = 0
 
     # ── F5 / 429 self-heal check after the Cl@ve hop ──
-    resp_text = body_text(driver)
+    # Reuse the body already read after the Cl@ve hop (avoids a redundant body_text +
+    # its WebDriverWait); fall back to a fresh read on the warm-SSO path that skipped
+    # the gateway block entirely.
+    resp_text = post_clave_text if post_clave_text is not None else body_text(driver)
     if detect_page_state(driver, resp_text) == PageState.RATE_LIMITED:
         return _handle_rate_limit(driver, context, resp_text, "post-clave")
 
@@ -1435,6 +1471,9 @@ def cycle_cita(
         logging.error("Timed out waiting for acEntrada (btnCopiar) to load")
         _capture_diagnostics(driver, "copiar-not-found", context.save_artifacts)
         return None
+    # Reached acEntrada → the Cl@ve SSO worked this cycle; clear any stuck counter
+    # (covers the warm-SSO path that skips the gateway block entirely).
+    context._clave_stuck_count = 0
     logging.info("[con-Cl@ve 3] acEntrada — clicking Copiar (autofill NIE + name)")
     _real_click(driver, copiar_btn)  # real click — autofills from the Cl@ve identity
     time.sleep(random.uniform(2.5, 4.5))  # human pause: review the autofilled form

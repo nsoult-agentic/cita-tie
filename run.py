@@ -476,6 +476,7 @@ def main():
         profile.first_load = os.environ.get("PRESERVE_COOKIES", "").lower() != "true"
         profile.bot_result = False
         profile._rate_limit_count = 0
+        profile._clave_stuck_count = 0  # per-run reset so "consecutive stuck" is within-run, not cumulative
 
         # Add jitter to avoid pattern detection
         jitter = random.uniform(0, sleep_time * 0.3)
