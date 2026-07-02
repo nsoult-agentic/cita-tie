@@ -2,6 +2,8 @@ services:
   cita-tie:
     image: ghcr.io/nsoult-agentic/cita-tie:sha-f06a098
     container_name: cita-tie
+    labels:
+      - "diun.enable=false"  # our own CI/sha-built image; diun watches third-party only (brain #2538)
     restart: unless-stopped
     ports:
       # Bind to the NUC's LAN IP so the SMS-code entry page is reachable from
