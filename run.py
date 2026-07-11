@@ -540,6 +540,19 @@ def main():
             log.info("APPOINTMENT BOOKED! Exiting.")
             break
 
+        # 4047 offer hold: if this run's once-per-run 4047 sin-Cl@ve probe hit an
+        # offer, keep the browser parked on it (skip the normal cycle) so Neil can
+        # finish the booking via /control before the loop re-walks 4010 and
+        # navigates away. Detect-only, so the human still does the captcha + SMS.
+        import bcncita.cita as _cita_mod
+        if getattr(_cita_mod, "LAST_4047_OFFER", False):
+            _cita_mod.LAST_4047_OFFER = False
+            hold_s = int(os.environ.get("PROBE_4047_HOLD_S", "1800"))
+            _stats["last_state"] = "4047 offer — holding for /control booking"
+            log.info(f"4047 OFFER — holding {hold_s}s; browser parked on the offer for /control booking")
+            time.sleep(hold_s)
+            continue
+
         # Periodic heartbeat
         if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
             _ntfy("TIE Checker Status", _heartbeat_summary(), ntfy_config, priority="low", tags="chart_with_upwards_trend")

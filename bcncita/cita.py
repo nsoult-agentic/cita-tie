@@ -546,6 +546,12 @@ def init_wedriver(context: CustomerProfile):
     return browser
 
 
+# Set True by start_with when the once-per-run 4047 sin-Cl@ve probe reaches an
+# offer; run.py's active polling loop reads it to hold the browser on the offer
+# page long enough for a human to finish the booking via /control.
+LAST_4047_OFFER = False
+
+
 def try_cita(context: CustomerProfile, cycles: int = CYCLES):
     driver = init_wedriver(context)
     return start_with(driver, context, cycles)  # PAI: return result
@@ -643,6 +649,34 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
     if not success:
         logging.error("FAIL - all cycles exhausted")
         # PAI: no ntfy here — the scheduler in run.py handles retry notifications
+
+    # PROBE_4047: after the 4010 con-Cl@ve cycles, poll the sin-Cl@ve 4047
+    # (DGGM-resolved cards) queue once, reusing this same warm reattached driver
+    # in the same single thread — so no lock is needed vs. the 4010 walk. 4047
+    # needs no Cl@ve (no QR), so it runs unattended in the active loop. It is
+    # detect-only and never books. On an offer it sets LAST_4047_OFFER so run.py
+    # parks the browser on the offer page.
+    if (not success and os.environ.get("PROBE_4047", "").lower() == "true"
+            and context.province == Province.BARCELONA):
+        # Space out from the last con-Cl@ve walk so the extra ~6 requests don't
+        # trip the F5 "Request Rejected" WAF — match the proven inter-cycle
+        # window (~60-90s kept the host poller clean for hours; see above).
+        time.sleep(random.uniform(60, 90))
+        try:
+            outcome = probe_4047_sinclave(driver, context)
+            logging.info(f"[4047 probe] outcome: {outcome}")
+            if outcome == "OFFER":
+                globals()["LAST_4047_OFFER"] = True
+                _ntfy(
+                    "cita-tie: 4047 slot?",
+                    "4047 sin-Clave acCitar shows a SLOT table. Book now via "
+                    "/control (captcha + SMS); this queue needs no QR. Browser "
+                    "is parked on the offer.",
+                    priority="urgent",
+                    tags="rotating_light,passport_control",
+                )
+        except Exception as e:
+            logging.warning(f"[4047 probe] {str(e).split(chr(10))[0]}")
 
     # PAI: fallback report after cycle loop
     report = get_fallback_report()
