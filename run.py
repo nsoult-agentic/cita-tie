@@ -43,7 +43,15 @@ _stats = {
 
 
 # ── Remote orchestration state (manual control of one Selenium driver) ──
-_ctl = {"driver": None, "profile": None}
+_ctl = {"driver": None, "profile": None, "last_control": 0.0}
+
+# Serializes access to the single driver between the /control API (human-driven
+# booking) and the unattended PROBE_4047 loop, so they never navigate mid-walk.
+_ctl_lock = threading.Lock()
+
+# The PROBE_4047 loop yields (skips its walk) if a /control command arrived within
+# this many seconds — i.e. while a human is actively driving the booking.
+CONTROL_IDLE_GUARD = int(os.environ.get("CONTROL_IDLE_GUARD", "300"))
 
 
 def _ctl_get_driver():
@@ -113,6 +121,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
         from selenium.webdriver.support.ui import Select
         q = urllib.parse.parse_qs(parsed.query)
         cmd = parsed.path[len("/control/"):]
+        _ctl["last_control"] = time.time()
+        _ctl_lock.acquire()
         try:
             d = _ctl_get_driver()
             if cmd == "nav":
@@ -187,6 +197,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
             return self._cjson({"error": "unknown command: %s" % cmd}, 404)
         except Exception as e:
             return self._cjson({"error": str(e).splitlines()[0] if str(e) else type(e).__name__}, 500)
+        finally:
+            _ctl_lock.release()
 
     def do_POST(self):
         import urllib.parse
@@ -194,11 +206,15 @@ class _HealthHandler(BaseHTTPRequestHandler):
         if parsed.path == "/control/eval":
             ln = int(self.headers.get("Content-Length", "0"))
             js = self.rfile.read(ln).decode("utf-8")
+            _ctl["last_control"] = time.time()
+            _ctl_lock.acquire()
             try:
                 d = _ctl_get_driver()
                 return self._cjson({"result": d.execute_script(js)})
             except Exception as e:
                 return self._cjson({"error": str(e).splitlines()[0] if str(e) else type(e).__name__}, 500)
+            finally:
+                _ctl_lock.release()
         self._cjson({"error": "not found"}, 404)
 
     def log_message(self, *args):
@@ -415,8 +431,47 @@ def main():
             log.info("ORCHESTRATE_ONLY: profile loaded; automated polling PAUSED. Control API on /control/*")
         except SystemExit:
             log.error("ORCHESTRATE_ONLY: profile load failed; control API still up (no profile)")
+
+        # PROBE_4047: 4047 ("cards resolved by the Dirección General de Gestión
+        # Migratoria") is sin-Cl@ve (no QR), so — unlike the 4010 con-Cl@ve path —
+        # it CAN poll unattended even while the main loop is paused. This detects
+        # only and never books; on a hit it alerts and parks the browser on the
+        # offer for step-by-step /control finishing (captcha + SMS).
+        probe_4047 = os.environ.get("PROBE_4047", "").lower() == "true" and _ctl.get("profile") is not None
+        if probe_4047:
+            from bcncita.cita import probe_4047_sinclave
+            from bcncita.cita import _ntfy as _cita_ntfy
+            log.info("PROBE_4047: unattended sin-Cl@ve polling of the 4047 queue ENABLED")
         while True:
-            time.sleep(3600)
+            if not probe_4047:
+                time.sleep(3600)
+                continue
+            # Yield to any live human-driven /control orchestration.
+            if time.time() - _ctl.get("last_control", 0.0) < CONTROL_IDLE_GUARD:
+                time.sleep(30)
+                continue
+            outcome = "ERROR"
+            with _ctl_lock:
+                try:
+                    outcome = probe_4047_sinclave(_ctl_get_driver(), _ctl["profile"])
+                except Exception as e:
+                    log.warning(f"PROBE_4047 error: {str(e).splitlines()[0] if str(e) else type(e).__name__}")
+            log.info(f"PROBE_4047 outcome: {outcome}")
+            if outcome == "OFFER":
+                _cita_ntfy(
+                    "cita-tie: 4047 slot?",
+                    "4047 sin-Clave reached acCitar WITHOUT 'no hay citas'. "
+                    "Finish the booking now via /control (captcha + SMS).",
+                    priority="urgent",
+                    tags="rotating_light,passport_control",
+                )
+                # Stop probing so the browser stays parked on the offer page.
+                log.info("PROBE_4047: OFFER found — probe paused; browser left on the offer page.")
+                probe_4047 = False
+                continue
+            hot = is_hot_window()
+            sleep_s = HOT_SLEEP if hot else COLD_SLEEP
+            time.sleep(sleep_s + random.uniform(0, sleep_s * 0.3))
 
     # Start health server FIRST so the endpoint is observable even if
     # build_profile() exits or Firefox/Xvfb init fails downstream.

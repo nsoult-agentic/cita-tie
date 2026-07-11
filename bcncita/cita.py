@@ -1862,3 +1862,61 @@ def add_reason(driver: webdriver, context: CustomerProfile):
                 element.send_keys(context.reason_or_type)
     except Exception as e:
         logging.error(e)
+
+
+def probe_4047_sinclave(driver: webdriver, context: CustomerProfile) -> str:
+    """Poll the Barcelona 4047 queue ("POLICÍA-EXPEDICIÓN DE TARJETAS CUYA
+    AUTORIZACIÓN RESUELVE LA DIRECCIÓN GENERAL DE GESTIÓN MIGRATORIA") via its
+    sin-Cl@ve path.
+
+    4047 exposes no con-Cl@ve button and needs NO Cl@ve login (no QR), so this
+    can run unattended. It walks all the way to acCitar — the real availability
+    gate — and DETECTS only. It never books: finalizing a 4047 slot still needs a
+    CAPTCHA + SMS + a human. On a hit it returns "OFFER" and leaves the browser on
+    the offer page for step-by-step /control booking.
+
+    Returns "EMPTY" (no citas), "OFFER" (acCitar reached with slots), or "ERROR"
+    (walk did not complete).
+    """
+    base = "https://icp.administracionelectronica.gob.es/icpplustieb"
+    try:
+        driver.get(f"{base}/citar?p=8&locale=es")
+        time.sleep(2)
+        Select(driver.find_element(By.ID, "sede")).select_by_value("99")
+        Select(driver.find_element(By.NAME, "tramiteGrupo[0]")).select_by_value("4047")
+        driver.execute_script("envia();")
+        time.sleep(2)
+        # acInfo — "Entrar" (sin-Cl@ve; 4047 offers no con-Cl@ve button).
+        _real_click(driver, driver.find_element(By.ID, "btnEntrar"))
+        time.sleep(2)
+        # Availability can be gated here (before identity) when the cupo is 0.
+        if "no hay citas" in driver.find_element(By.TAG_NAME, "body").text.lower():
+            return "EMPTY"
+        # acEntrada identity form: NIE doc type + doc number + name.
+        try:
+            radio = driver.find_element(By.ID, "rdbTipoDocNie")
+            if not radio.is_selected():
+                _real_click(driver, radio)
+        except Exception:
+            pass
+        doc = driver.find_element(By.ID, "txtIdCitado")
+        doc.clear()
+        doc.send_keys(context.doc_value)
+        nom = driver.find_element(By.ID, "txtDesCitado")
+        nom.clear()
+        nom.send_keys(context.name)
+        time.sleep(1)
+        _real_click(driver, driver.find_element(By.ID, "btnEnviar"))
+        time.sleep(2)
+        # acValidarEntrada — request the cita (server-side availability check).
+        driver.execute_script("enviar('solicitud');")
+        time.sleep(2)
+        body = driver.find_element(By.TAG_NAME, "body").text
+        if "no hay citas" in body.lower():
+            return "EMPTY"
+        # Reached acCitar without the empty message -> a real offer.
+        logging.warning("[4047 probe] OFFER reached at acCitar:\n" + body[:1500])
+        return "OFFER"
+    except Exception as e:
+        logging.warning(f"[4047 probe] walk error: {str(e).splitlines()[0]}")
+        return "ERROR"
