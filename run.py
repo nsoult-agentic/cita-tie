@@ -121,10 +121,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
         from selenium.webdriver.support.ui import Select
         q = urllib.parse.parse_qs(parsed.query)
         cmd = parsed.path[len("/control/"):]
-        _ctl["last_control"] = time.time()
-        # Pause/resume the unattended PROBE_4047 loop (call before/after a
-        # human-driven con-Cl@ve booking so the probe never navigates the shared
-        # driver mid-booking). Handled without the driver / before the lock.
+        # Pause/resume/status for the unattended PROBE_4047 loop (call before/
+        # after a human-driven con-Cl@ve booking so the probe never navigates the
+        # shared driver mid-booking). This is NOT a driver interaction, so it is
+        # handled before the lock AND before bumping last_control — otherwise a
+        # status poll would keep resetting the idle guard and starve the probe.
         if cmd == "probe":
             sub = q.get("cmd", ["status"])[0]
             if sub == "pause":
@@ -132,6 +133,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             elif sub == "resume":
                 _ctl["probe_pause"] = False
             return self._cjson({"ok": True, "probe_pause": _ctl["probe_pause"]})
+        _ctl["last_control"] = time.time()
         if not _ctl_lock.acquire(timeout=120):
             return self._cjson({"error": "driver busy (probe walk in progress)"}, 503)
         try:
