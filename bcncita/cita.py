@@ -1870,28 +1870,46 @@ def probe_4047_sinclave(driver: webdriver, context: CustomerProfile) -> str:
     sin-Cl@ve path.
 
     4047 exposes no con-Cl@ve button and needs NO Cl@ve login (no QR), so this
-    can run unattended. It walks all the way to acCitar — the real availability
-    gate — and DETECTS only. It never books: finalizing a 4047 slot still needs a
-    CAPTCHA + SMS + a human. On a hit it returns "OFFER" and leaves the browser on
-    the offer page for step-by-step /control booking.
+    can run unattended. It walks to acCitar — the real availability gate — and
+    DETECTS only. It never books: finalizing a 4047 slot still needs a CAPTCHA +
+    SMS + a human. On a hit it returns "OFFER" and leaves the browser on the
+    offer page for step-by-step /control booking.
 
-    Returns "EMPTY" (no citas), "OFFER" (acCitar reached with slots), or "ERROR"
-    (walk did not complete).
+    Classification uses the shared detect_page_state(): the mere absence of "no
+    hay citas" is NOT a slot — F5/429/error pages also lack that phrase, so those
+    are reported as ERROR (retry), never OFFER.
+
+    Returns "EMPTY", "OFFER", or "ERROR".
     """
     base = "https://icp.administracionelectronica.gob.es/icpplustieb"
     try:
+        try:
+            driver.set_page_load_timeout(30)  # bound the walk so it can't wedge the shared driver
+        except Exception:
+            pass
         driver.get(f"{base}/citar?p=8&locale=es")
         time.sleep(2)
-        Select(driver.find_element(By.ID, "sede")).select_by_value("99")
-        Select(driver.find_element(By.NAME, "tramiteGrupo[0]")).select_by_value("4047")
-        driver.execute_script("envia();")
-        time.sleep(2)
+        # Office + trámite via the proven retry loop (the site re-renders the
+        # selection page once with the trámite reset).
+        _select_and_submit_tramite(driver, context, "tramiteGrupo[0]", "4047")
+        time.sleep(1)
         # acInfo — "Entrar" (sin-Cl@ve; 4047 offers no con-Cl@ve button).
-        _real_click(driver, driver.find_element(By.ID, "btnEntrar"))
+        entrar = driver.find_elements(By.ID, "btnEntrar")
+        if not entrar:
+            state = detect_page_state(driver)
+            if state == PageState.NO_APPOINTMENTS:
+                return "EMPTY"
+            logging.warning(f"[4047 probe] no btnEntrar on acInfo (state={state.name})")
+            return "ERROR"
+        _real_click(driver, entrar[0])
         time.sleep(2)
         # Availability can be gated here (before identity) when the cupo is 0.
-        if "no hay citas" in driver.find_element(By.TAG_NAME, "body").text.lower():
+        state = detect_page_state(driver)
+        if state == PageState.NO_APPOINTMENTS:
             return "EMPTY"
+        if state != PageState.PERSONAL_INFO:
+            logging.warning(f"[4047 probe] unexpected state after Entrar: {state.name}")
+            return "ERROR"
         # acEntrada identity form: NIE doc type + doc number + name.
         try:
             radio = driver.find_element(By.ID, "rdbTipoDocNie")
@@ -1905,18 +1923,28 @@ def probe_4047_sinclave(driver: webdriver, context: CustomerProfile) -> str:
         nom = driver.find_element(By.ID, "txtDesCitado")
         nom.clear()
         nom.send_keys(context.name)
-        time.sleep(1)
-        _real_click(driver, driver.find_element(By.ID, "btnEnviar"))
+        time.sleep(random.uniform(0.8, 1.6))
+        # Submit via envia() (NOT a native click): a click at this transition
+        # trips the F5 WAF at acValidarEntrada (see cycle_cita's acEntrada step).
+        driver.execute_script("envia();")
         time.sleep(2)
         # acValidarEntrada — request the cita (server-side availability check).
         driver.execute_script("enviar('solicitud');")
         time.sleep(2)
-        body = driver.find_element(By.TAG_NAME, "body").text
-        if "no hay citas" in body.lower():
+        # acCitar — classify with the shared detector.
+        state = detect_page_state(driver)
+        if state in (PageState.SLOT_SELECTION_TABLE, PageState.SLOT_SELECTION_5MIN):
+            logging.warning(f"[4047 probe] OFFER at acCitar ({state.name})")
+            return "OFFER"
+        if state == PageState.NO_APPOINTMENTS:
             return "EMPTY"
-        # Reached acCitar without the empty message -> a real offer.
-        logging.warning("[4047 probe] OFFER reached at acCitar:\n" + body[:1500])
-        return "OFFER"
+        logging.warning(f"[4047 probe] acCitar non-slot state {state.name} — treating as ERROR")
+        return "ERROR"
     except Exception as e:
         logging.warning(f"[4047 probe] walk error: {str(e).splitlines()[0]}")
         return "ERROR"
+    finally:
+        try:
+            driver.set_page_load_timeout(300)  # restore a sane default for /control
+        except Exception:
+            pass

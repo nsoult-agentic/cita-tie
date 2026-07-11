@@ -43,7 +43,7 @@ _stats = {
 
 
 # ── Remote orchestration state (manual control of one Selenium driver) ──
-_ctl = {"driver": None, "profile": None, "last_control": 0.0}
+_ctl = {"driver": None, "profile": None, "last_control": 0.0, "probe_pause": False}
 
 # Serializes access to the single driver between the /control API (human-driven
 # booking) and the unattended PROBE_4047 loop, so they never navigate mid-walk.
@@ -122,7 +122,18 @@ class _HealthHandler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(parsed.query)
         cmd = parsed.path[len("/control/"):]
         _ctl["last_control"] = time.time()
-        _ctl_lock.acquire()
+        # Pause/resume the unattended PROBE_4047 loop (call before/after a
+        # human-driven con-Cl@ve booking so the probe never navigates the shared
+        # driver mid-booking). Handled without the driver / before the lock.
+        if cmd == "probe":
+            sub = q.get("cmd", ["status"])[0]
+            if sub == "pause":
+                _ctl["probe_pause"] = True
+            elif sub == "resume":
+                _ctl["probe_pause"] = False
+            return self._cjson({"ok": True, "probe_pause": _ctl["probe_pause"]})
+        if not _ctl_lock.acquire(timeout=120):
+            return self._cjson({"error": "driver busy (probe walk in progress)"}, 503)
         try:
             d = _ctl_get_driver()
             if cmd == "nav":
@@ -207,7 +218,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
             ln = int(self.headers.get("Content-Length", "0"))
             js = self.rfile.read(ln).decode("utf-8")
             _ctl["last_control"] = time.time()
-            _ctl_lock.acquire()
+            if not _ctl_lock.acquire(timeout=120):
+                return self._cjson({"error": "driver busy (probe walk in progress)"}, 503)
             try:
                 d = _ctl_get_driver()
                 return self._cjson({"result": d.execute_script(js)})
@@ -446,9 +458,15 @@ def main():
             if not probe_4047:
                 time.sleep(3600)
                 continue
-            # Yield to any live human-driven /control orchestration.
-            if time.time() - _ctl.get("last_control", 0.0) < CONTROL_IDLE_GUARD:
-                time.sleep(30)
+            # Yield to human-driven /control orchestration. The explicit pause
+            # flag (set via /control/probe?cmd=pause before a con-Cl@ve booking)
+            # is the real protection — human steps like a QR scan or SMS wait can
+            # idle far longer than CONTROL_IDLE_GUARD, so the idle timer alone
+            # can't prevent the probe from clobbering a live booking. The idle
+            # guard is only a secondary backstop against grabbing the driver
+            # while a human is actively clicking.
+            if _ctl.get("probe_pause") or (time.time() - _ctl.get("last_control", 0.0) < CONTROL_IDLE_GUARD):
+                time.sleep(20)
                 continue
             outcome = "ERROR"
             with _ctl_lock:
@@ -460,8 +478,8 @@ def main():
             if outcome == "OFFER":
                 _cita_ntfy(
                     "cita-tie: 4047 slot?",
-                    "4047 sin-Clave reached acCitar WITHOUT 'no hay citas'. "
-                    "Finish the booking now via /control (captcha + SMS).",
+                    "4047 sin-Clave acCitar shows a SLOT table. Finish the "
+                    "booking now via /control (captcha + SMS); probe is paused.",
                     priority="urgent",
                     tags="rotating_light,passport_control",
                 )
