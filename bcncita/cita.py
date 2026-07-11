@@ -659,8 +659,9 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
     if (not success and os.environ.get("PROBE_4047", "").lower() == "true"
             and context.province == Province.BARCELONA):
         # Space out from the last con-Cl@ve walk so the extra ~6 requests don't
-        # trip the F5 "Request Rejected" WAF.
-        time.sleep(random.uniform(30, 60))
+        # trip the F5 "Request Rejected" WAF — match the proven inter-cycle
+        # window (~60-90s kept the host poller clean for hours; see above).
+        time.sleep(random.uniform(60, 90))
         try:
             outcome = probe_4047_sinclave(driver, context)
             logging.info(f"[4047 probe] outcome: {outcome}")
