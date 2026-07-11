@@ -1,6 +1,6 @@
 services:
   cita-tie:
-    image: ghcr.io/nsoult-agentic/cita-tie:sha-f06a098
+    image: ghcr.io/nsoult-agentic/cita-tie:sha-34da491
     container_name: cita-tie
     labels:
       - "diun.enable=false"  # our own CI/sha-built image; diun watches third-party only (brain #2538)
