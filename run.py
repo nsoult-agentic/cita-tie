@@ -43,7 +43,15 @@ _stats = {
 
 
 # ── Remote orchestration state (manual control of one Selenium driver) ──
-_ctl = {"driver": None, "profile": None}
+_ctl = {"driver": None, "profile": None, "last_control": 0.0, "probe_pause": False}
+
+# Serializes access to the single driver between the /control API (human-driven
+# booking) and the unattended PROBE_4047 loop, so they never navigate mid-walk.
+_ctl_lock = threading.Lock()
+
+# The PROBE_4047 loop yields (skips its walk) if a /control command arrived within
+# this many seconds — i.e. while a human is actively driving the booking.
+CONTROL_IDLE_GUARD = int(os.environ.get("CONTROL_IDLE_GUARD", "300"))
 
 
 def _ctl_get_driver():
@@ -113,6 +121,21 @@ class _HealthHandler(BaseHTTPRequestHandler):
         from selenium.webdriver.support.ui import Select
         q = urllib.parse.parse_qs(parsed.query)
         cmd = parsed.path[len("/control/"):]
+        # Pause/resume/status for the unattended PROBE_4047 loop (call before/
+        # after a human-driven con-Cl@ve booking so the probe never navigates the
+        # shared driver mid-booking). This is NOT a driver interaction, so it is
+        # handled before the lock AND before bumping last_control — otherwise a
+        # status poll would keep resetting the idle guard and starve the probe.
+        if cmd == "probe":
+            sub = q.get("cmd", ["status"])[0]
+            if sub == "pause":
+                _ctl["probe_pause"] = True
+            elif sub == "resume":
+                _ctl["probe_pause"] = False
+            return self._cjson({"ok": True, "probe_pause": _ctl["probe_pause"]})
+        _ctl["last_control"] = time.time()
+        if not _ctl_lock.acquire(timeout=120):
+            return self._cjson({"error": "driver busy (probe walk in progress)"}, 503)
         try:
             d = _ctl_get_driver()
             if cmd == "nav":
@@ -187,6 +210,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
             return self._cjson({"error": "unknown command: %s" % cmd}, 404)
         except Exception as e:
             return self._cjson({"error": str(e).splitlines()[0] if str(e) else type(e).__name__}, 500)
+        finally:
+            _ctl_lock.release()
 
     def do_POST(self):
         import urllib.parse
@@ -194,11 +219,16 @@ class _HealthHandler(BaseHTTPRequestHandler):
         if parsed.path == "/control/eval":
             ln = int(self.headers.get("Content-Length", "0"))
             js = self.rfile.read(ln).decode("utf-8")
+            _ctl["last_control"] = time.time()
+            if not _ctl_lock.acquire(timeout=120):
+                return self._cjson({"error": "driver busy (probe walk in progress)"}, 503)
             try:
                 d = _ctl_get_driver()
                 return self._cjson({"result": d.execute_script(js)})
             except Exception as e:
                 return self._cjson({"error": str(e).splitlines()[0] if str(e) else type(e).__name__}, 500)
+            finally:
+                _ctl_lock.release()
         self._cjson({"error": "not found"}, 404)
 
     def log_message(self, *args):
@@ -415,8 +445,53 @@ def main():
             log.info("ORCHESTRATE_ONLY: profile loaded; automated polling PAUSED. Control API on /control/*")
         except SystemExit:
             log.error("ORCHESTRATE_ONLY: profile load failed; control API still up (no profile)")
+
+        # PROBE_4047: 4047 ("cards resolved by the Dirección General de Gestión
+        # Migratoria") is sin-Cl@ve (no QR), so — unlike the 4010 con-Cl@ve path —
+        # it CAN poll unattended even while the main loop is paused. This detects
+        # only and never books; on a hit it alerts and parks the browser on the
+        # offer for step-by-step /control finishing (captcha + SMS).
+        probe_4047 = os.environ.get("PROBE_4047", "").lower() == "true" and _ctl.get("profile") is not None
+        if probe_4047:
+            from bcncita.cita import probe_4047_sinclave
+            from bcncita.cita import _ntfy as _cita_ntfy
+            log.info("PROBE_4047: unattended sin-Cl@ve polling of the 4047 queue ENABLED")
         while True:
-            time.sleep(3600)
+            if not probe_4047:
+                time.sleep(3600)
+                continue
+            # Yield to human-driven /control orchestration. The explicit pause
+            # flag (set via /control/probe?cmd=pause before a con-Cl@ve booking)
+            # is the real protection — human steps like a QR scan or SMS wait can
+            # idle far longer than CONTROL_IDLE_GUARD, so the idle timer alone
+            # can't prevent the probe from clobbering a live booking. The idle
+            # guard is only a secondary backstop against grabbing the driver
+            # while a human is actively clicking.
+            if _ctl.get("probe_pause") or (time.time() - _ctl.get("last_control", 0.0) < CONTROL_IDLE_GUARD):
+                time.sleep(20)
+                continue
+            outcome = "ERROR"
+            with _ctl_lock:
+                try:
+                    outcome = probe_4047_sinclave(_ctl_get_driver(), _ctl["profile"])
+                except Exception as e:
+                    log.warning(f"PROBE_4047 error: {str(e).splitlines()[0] if str(e) else type(e).__name__}")
+            log.info(f"PROBE_4047 outcome: {outcome}")
+            if outcome == "OFFER":
+                _cita_ntfy(
+                    "cita-tie: 4047 slot?",
+                    "4047 sin-Clave acCitar shows a SLOT table. Finish the "
+                    "booking now via /control (captcha + SMS); probe is paused.",
+                    priority="urgent",
+                    tags="rotating_light,passport_control",
+                )
+                # Stop probing so the browser stays parked on the offer page.
+                log.info("PROBE_4047: OFFER found — probe paused; browser left on the offer page.")
+                probe_4047 = False
+                continue
+            hot = is_hot_window()
+            sleep_s = HOT_SLEEP if hot else COLD_SLEEP
+            time.sleep(sleep_s + random.uniform(0, sleep_s * 0.3))
 
     # Start health server FIRST so the endpoint is observable even if
     # build_profile() exits or Firefox/Xvfb init fails downstream.
