@@ -65,8 +65,28 @@ services:
   # survives code iterations). CI only bumps the cita-tie image line, so GitOps
   # leaves this service running.
   cita-browser:
-    image: selenium/standalone-firefox:latest
+    # Pinned OFF the floating :latest tag onto the running image's digest — reproducible
+    # and diun-watchable (pin-to-current hardening direction, brain #2539). This digest is
+    # the image the container was already running on 2026-07-21, so deploying this is a
+    # zero-change pull (no browser restart, the Cl@ve session survives).
+    # NOTE: upstream :latest / tag 4.46.0 has since moved to sha256:68754beb…, a NEWER
+    # image than the one running. We deliberately pin to the RUNNING digest, not 4.46.0,
+    # to keep this a zero-change deploy; the digest carries no version tag because it no
+    # longer matches any current floating tag. diun (labels below) will NOTIFY on the
+    # newer 4.46.0 (and later X.Y.Z) releases — moving forward is then an explicit,
+    # reviewable digest bump, never an automatic float.
+    image: selenium/standalone-firefox@sha256:13daa8c5e0803973e34fba9f526112717b425e2b45cd72cc218b757283023098
     container_name: cita-browser
+    labels:
+      # Third-party image: diun WATCHES + NOTIFIES on new releases (it never auto-moves the pin).
+      - "diun.enable=true"
+      - "diun.watch_repo=true"
+      - "diun.sort_tags=semver"
+      - "diun.max_tags=3"
+      # Selenium-grid release tags are bare X.Y.Z (no 'v'). Anchor to those only, so the
+      # browser-version tags (152.0.x), -geckodriver/-grid variants and date-stamped tags
+      # don't drown the notification. $$ escapes to a literal $ after compose interpolation.
+      - 'diun.include_tags=^\d+\.\d+\.\d+$$'
     restart: unless-stopped
     shm_size: 2g
     ports:
