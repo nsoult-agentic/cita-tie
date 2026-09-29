@@ -403,7 +403,9 @@ def _ntfy(title, message, ntfy_config_raw, priority="default", tags=""):
 
 
 def cleanup_old_screenshots(data_dir="/app/data", max_age_days=7):
-    """Delete screenshots older than max_age_days to prevent PII accumulation."""
+    """Delete screenshots older than max_age_days to prevent PII accumulation.
+    Top-level *.png only: the no-citas evidence record under
+    /app/data/evidence/ is kept on purpose and must not be globbed here."""
     cutoff = time.time() - (max_age_days * 86400)
     for f in pathlib.Path(data_dir).glob("*.png"):
         try:
