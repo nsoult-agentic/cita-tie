@@ -4,6 +4,7 @@ Modified for PAI: headless Docker, ntfy notifications, no os._exit, SMS HTTP end
 All PAI modifications marked with # PAI: comments.
 Resilience layer: selectors.py + resilience.py for fallback strategies and page state detection.
 """
+import hashlib
 import io
 import json
 import logging
@@ -159,6 +160,91 @@ def _capture_diagnostics(driver: webdriver, label: str, save_artifacts: bool = T
             driver.save_screenshot(f"/app/data/diag-{label}-{ts}.png")
     except Exception as e:
         logging.error(f"[DIAG:{label}] Diagnostic capture failed: {e}")
+
+
+# PAI: evidence log — every "no hay citas" result is kept as a date/time-stamped
+# screenshot plus one line in index.jsonl (time, check, URL, file, sha256), as a
+# record of each failed attempt. It lives in its own subdirectory, which
+# cleanup_old_screenshots() in run.py (top-level /app/data/*.png only) never
+# touches, so the record is never auto-deleted.
+EVIDENCE_DIR = os.environ.get("EVIDENCE_DIR", "/app/data/evidence/no-citas")
+
+
+# Stamp shown ON the screenshot, so the capture time is visible in the image
+# itself, not only in the file name. Added by the bot (fixed to the bottom edge,
+# clearly labelled) and removed right after the capture. Time = NUC clock.
+_EVIDENCE_STAMP_JS = """
+var d = document.createElement('div');
+d.id = '__cita_evidence_stamp';
+d.textContent = arguments[0];
+d.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;'
+  + 'background:#000;color:#fff;font:16px/1.4 monospace;padding:6px 10px;'
+  + 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+(document.body || document.documentElement).appendChild(d);
+"""
+_EVIDENCE_UNSTAMP_JS = (
+    "var d = document.getElementById('__cita_evidence_stamp'); if (d) d.remove();"
+)
+
+
+def _shrink_png(png: bytes) -> bytes:
+    """Re-encode as a 16-level greyscale PNG. These are mostly white text pages:
+    greyscale keeps text legible (incl. coloured text a 1-bit threshold could
+    drop) at a fraction of the size. Returns the original bytes if Pillow is
+    unavailable or fails."""
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(png)).convert("L")
+        img = img.point(lambda v: (v // 17) * 17)  # 16 grey levels
+        out = io.BytesIO()
+        img.save(out, format="PNG", optimize=True)
+        small = out.getvalue()
+        return small if len(small) < len(png) else png
+    except Exception as e:
+        logging.warning(f"[evidence] PNG shrink skipped: {e}")
+        return png
+
+
+def _capture_no_citas_evidence(driver: webdriver, label: str):
+    """Save a date/time-stamped screenshot of the current "no hay citas" page
+    and index it. Never raises — a failed capture must not break the cycle."""
+    try:
+        now = dt.now().astimezone()
+        day = now.strftime("%Y-%m-%d")
+        day_dir = os.path.join(EVIDENCE_DIR, day)
+        os.makedirs(day_dir, exist_ok=True)
+        name = f"{now.strftime('%Y%m%d-%H%M%S')}-{label}.png"
+        url = driver.current_url
+        stamp = (
+            f"Captured by cita-tie: {now.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"(UTC{now.strftime('%z')}) | {label} | {url}"
+        )
+        try:
+            driver.execute_script(_EVIDENCE_STAMP_JS, stamp)
+        except Exception as e:
+            logging.warning(f"[evidence] stamp overlay failed: {e}")
+        try:
+            png = driver.get_screenshot_as_png()
+        finally:
+            try:
+                driver.execute_script(_EVIDENCE_UNSTAMP_JS)
+            except Exception:
+                pass
+        png = _shrink_png(png)
+        with open(os.path.join(day_dir, name), "wb") as f:
+            f.write(png)
+        entry = {
+            "time": now.isoformat(timespec="seconds"),
+            "check": label,
+            "url": url,
+            "file": f"{day}/{name}",
+            "sha256": hashlib.sha256(png).hexdigest(),
+        }
+        with open(os.path.join(EVIDENCE_DIR, "index.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        logging.info(f"[evidence] no-citas screenshot saved: {entry['file']}")
+    except Exception as e:
+        logging.error(f"[evidence] no-citas capture failed: {e}")
 
 
 # PAI: ntfy notification helper — reads config from /secrets/ntfy.json
@@ -1577,6 +1663,7 @@ def cycle_cita(
         return _handle_rate_limit(driver, context, resp_text, "accitar")
     if page_state == PageState.NO_APPOINTMENTS:
         logging.info("[con-Cl@ve 5] acCitar — no hay citas disponibles this cycle")
+        _capture_no_citas_evidence(driver, "4010-clave")
         context._rate_limit_count = 0  # clean cycle reached the citas page
         return None
     if page_state in (PageState.SLOT_SELECTION_TABLE, PageState.SLOT_SELECTION_5MIN):
@@ -1932,6 +2019,7 @@ def probe_4047_sinclave(driver: webdriver, context: CustomerProfile) -> str:
         if not entrar:
             state = detect_page_state(driver)
             if state == PageState.NO_APPOINTMENTS:
+                _capture_no_citas_evidence(driver, "4047-sinclave")
                 return "EMPTY"
             logging.warning(f"[4047 probe] no btnEntrar on acInfo (state={state.name})")
             return "ERROR"
@@ -1940,6 +2028,7 @@ def probe_4047_sinclave(driver: webdriver, context: CustomerProfile) -> str:
         # Availability can be gated here (before identity) when the cupo is 0.
         state = detect_page_state(driver)
         if state == PageState.NO_APPOINTMENTS:
+            _capture_no_citas_evidence(driver, "4047-sinclave")
             return "EMPTY"
         if state != PageState.PERSONAL_INFO:
             logging.warning(f"[4047 probe] unexpected state after Entrar: {state.name}")
@@ -1971,6 +2060,7 @@ def probe_4047_sinclave(driver: webdriver, context: CustomerProfile) -> str:
             logging.warning(f"[4047 probe] OFFER at acCitar ({state.name})")
             return "OFFER"
         if state == PageState.NO_APPOINTMENTS:
+            _capture_no_citas_evidence(driver, "4047-sinclave")
             return "EMPTY"
         logging.warning(f"[4047 probe] acCitar non-slot state {state.name} — treating as ERROR")
         return "ERROR"
