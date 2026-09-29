@@ -2,3 +2,4 @@ selenium>=4.15,<5
 capmonstercloudclient>=1.0,<2
 requests>=2.28
 backoff>=2.1.2
+Pillow>=10,<12
