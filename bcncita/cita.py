@@ -1678,6 +1678,16 @@ def cycle_cita(
     if not copiar_btn:
         logging.error("Timed out waiting for acEntrada (btnCopiar) to load")
         _capture_diagnostics(driver, "copiar-not-found", context.save_artifacts)
+        # ICP "Su sesión ha caducado por permanecer demasiado tiempo inactiva" (infogenerica):
+        # a stale icp-domain session cookie (e.g. left over from a long QR wait) makes every
+        # Cl@ve return land here. Drop ONLY icp cookies (Cl@ve SSO on clave.gob.es survives).
+        try:
+            on_icp = "administracionelectronica" in (driver.current_url or "")
+        except Exception:
+            on_icp = False
+        if on_icp and "ha caducado" in (body_text(driver) or "").lower():
+            logging.warning("ICP session expired page — clearing icp-domain cookies, retry next cycle")
+            clear_icp_cookies(driver)
         return None
     # Reached acEntrada → the Cl@ve SSO worked this cycle; clear any stuck counter
     # (covers the warm-SSO path that skips the gateway block entirely).
