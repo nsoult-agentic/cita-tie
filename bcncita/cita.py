@@ -205,12 +205,43 @@ def _shrink_png(png: bytes) -> bytes:
         return png
 
 
+# Screenshots per day, spread out: the day is split into EVIDENCE_PER_DAY equal
+# slots and only the first no-citas page in each slot is photographed. Every
+# check is still appended to index.jsonl (file=null when skipped), so
+# attempt counts stay complete.
+EVIDENCE_PER_DAY = int(os.environ.get("EVIDENCE_PER_DAY", "10"))
+_evidence_slots_taken = set()
+
+
+def _evidence_slot(now) -> str:
+    minutes = now.hour * 60 + now.minute
+    return f"{now:%Y-%m-%d}/{minutes * EVIDENCE_PER_DAY // 1440}"
+
+
 def _capture_no_citas_evidence(driver: webdriver, label: str):
-    """Save a date/time-stamped screenshot of the current "no hay citas" page
-    and index it. Never raises — a failed capture must not break the cycle."""
+    """Index every "no hay citas" result; screenshot (date/time-stamped) only the
+    first one in each of the day's EVIDENCE_PER_DAY slots. Never raises — a
+    failed capture must not break the cycle."""
     try:
         now = dt.now().astimezone()
         day = now.strftime("%Y-%m-%d")
+        slot = f"{label}:{_evidence_slot(now)}"
+        if EVIDENCE_PER_DAY > 0 and slot not in _evidence_slots_taken:
+            # After a redeploy the in-memory set is empty: rebuild it from today's files.
+            try:
+                for fn in os.listdir(os.path.join(EVIDENCE_DIR, day)):
+                    m = re.match(r"(\d{8})-(\d{2})(\d{2})\d{2}-(.+)\.png$", fn)
+                    if m:
+                        t = dt.strptime(m[1] + m[2] + m[3], "%Y%m%d%H%M")
+                        _evidence_slots_taken.add(f"{m[4]}:{_evidence_slot(t)}")
+            except FileNotFoundError:
+                pass
+        if EVIDENCE_PER_DAY > 0 and slot in _evidence_slots_taken:
+            entry = {"time": now.isoformat(timespec="seconds"), "check": label,
+                     "url": driver.current_url, "file": None}
+            with open(os.path.join(EVIDENCE_DIR, "index.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+            return
         day_dir = os.path.join(EVIDENCE_DIR, day)
         os.makedirs(day_dir, exist_ok=True)
         name = f"{now.strftime('%Y%m%d-%H%M%S')}-{label}.png"
@@ -242,6 +273,7 @@ def _capture_no_citas_evidence(driver: webdriver, label: str):
         }
         with open(os.path.join(EVIDENCE_DIR, "index.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
+        _evidence_slots_taken.add(slot)
         logging.info(f"[evidence] no-citas screenshot saved: {entry['file']}")
     except Exception as e:
         logging.error(f"[evidence] no-citas capture failed: {e}")
