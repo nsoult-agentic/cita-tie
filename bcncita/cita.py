@@ -297,6 +297,77 @@ def _ntfy(title, message, priority="default", tags=""):
         logging.error(f"ntfy send failed: {e}")
 
 
+# PAI: Cl@ve login-loss alerting + "no successful check" watchdog.
+# The Cl@ve Móvil IdP now lands on agenciatributaria.gob.es (ObtenerClaveMovilQR),
+# NOT pasarela.clave.gob.es, so an expired login used to fall through to
+# copiar-not-found with no push. These helpers detect the QR page, hold it long
+# enough for a scan, and alert (first time immediately, then every
+# CLAVE_ALERT_REPEAT_S until the login is back).
+CLAVE_QR_WAIT_S = int(os.environ.get("CLAVE_QR_WAIT_S", "240"))
+CLAVE_ALERT_REPEAT_S = int(os.environ.get("CLAVE_ALERT_REPEAT_S", "3600"))
+STALE_ALERT_S = int(os.environ.get("STALE_ALERT_S", "7200"))
+NOVNC_URL = os.environ.get("NOVNC_URL", "http://172.16.10.25:7900")
+
+_last_good_check = time.time()  # container start counts as the baseline
+_clave_alert_at = 0.0  # 0 = no outstanding login-lost alert
+_stale_alert_at = 0.0
+
+
+def _on_clave_qr_page(driver) -> bool:
+    try:
+        url = driver.current_url or ""
+        title = driver.title or ""
+    except Exception:
+        return False
+    return "ObtenerClaveMovilQR" in url or "/MOVI-" in url or "Cl@ve Móvil" in title
+
+
+def _alert_clave_needed(reason: str):
+    """Push "scan the QR" — immediately the first time, then at most every CLAVE_ALERT_REPEAT_S."""
+    global _clave_alert_at
+    now = time.time()
+    if _clave_alert_at and now - _clave_alert_at < CLAVE_ALERT_REPEAT_S:
+        return
+    _clave_alert_at = now
+    _ntfy(
+        "Cl@ve re-scan needed",
+        f"{reason}. No cita checks run until you scan. Open {NOVNC_URL} and scan the "
+        f"Cl@ve Móvil QR — the bot holds it on screen for {CLAVE_QR_WAIT_S // 60} min each attempt.",
+        priority="urgent",
+        tags="lock",
+    )
+
+
+def _mark_good_check():
+    """Called when a cycle reaches the real cita result page (Cl@ve worked end to end)."""
+    global _last_good_check, _clave_alert_at, _stale_alert_at
+    _last_good_check = time.time()
+    if _clave_alert_at:
+        _ntfy("Cl@ve login OK", "Cita checks are running again.", priority="default", tags="white_check_mark")
+    _clave_alert_at = 0.0
+    _stale_alert_at = 0.0
+
+
+def check_stale_and_alert():
+    """Push if no cycle has reached the cita result page for STALE_ALERT_S (repeats hourly)."""
+    global _stale_alert_at
+    now = time.time()
+    idle = now - _last_good_check
+    if idle < STALE_ALERT_S:
+        return
+    if _stale_alert_at and now - _stale_alert_at < CLAVE_ALERT_REPEAT_S:
+        return
+    _stale_alert_at = now
+    since = dt.fromtimestamp(_last_good_check).strftime("%d/%m %H:%M")
+    _ntfy(
+        "No cita checks working",
+        f"No check has reached the cita page for {idle / 3600:.1f}h (last good: {since}). "
+        f"Check the Cl@ve login at {NOVNC_URL} and the bot logs.",
+        priority="urgent",
+        tags="rotating_light",
+    )
+
+
 # PAI: SMS code HTTP endpoint for manual code entry
 _sms_code_value = None
 _sms_code_event = threading.Event()
@@ -704,6 +775,9 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
                 f"[METRICS] cycle={i+1} result={_classify_result(result, driver)} "
                 f"duration_s={_cycle_dur:.1f} rate_limit_count={_rl_count} first_load={_fl}"
             )
+            # Watchdog per cycle too: an expired login holds ~4 min per cycle, so a
+            # long HOT run would otherwise delay the between-runs stale check by hours.
+            check_stale_and_alert()
         except KeyboardInterrupt:
             raise
         except TimeoutException:
@@ -1565,13 +1639,7 @@ def cycle_cita(
             logging.warning(f"Cl@ve not through ({reason}) — stuck #{stuck}, retry next cycle")
             _capture_diagnostics(driver, "clave-auth-needed", context.save_artifacts)
             if stuck >= 3:
-                _ntfy(
-                    "Cl@ve re-scan needed",
-                    "Cl@ve looks expired (stuck on the gateway 3 cycles). "
-                    "Re-authenticate via noVNC at 172.16.10.25:7900, then the bot resumes.",
-                    priority="urgent",
-                    tags="lock",
-                )
+                _alert_clave_needed("Cl@ve looks expired (stuck on the gateway 3 cycles)")
             return None
         # Cl@ve carried through → SSO is alive; clear the stuck counter.
         context._clave_stuck_count = 0
@@ -1584,12 +1652,42 @@ def cycle_cita(
     if detect_page_state(driver, resp_text) == PageState.RATE_LIMITED:
         return _handle_rate_limit(driver, context, resp_text, "post-clave")
 
+    # ── Step 4b: Cl@ve Móvil QR page = login expired. Alert, then HOLD the QR on
+    # screen so a scan can complete (the old 30s element wait abandoned it). ──
+    if _on_clave_qr_page(driver):
+        logging.warning(f"[con-Cl@ve 2b] Cl@ve login expired — on the QR page; holding up to {CLAVE_QR_WAIT_S}s for a scan")
+        _alert_clave_needed("Cl@ve login expired")
+        deadline = time.time() + CLAVE_QR_WAIT_S
+        while time.time() < deadline and _on_clave_qr_page(driver):
+            time.sleep(5)
+        if _on_clave_qr_page(driver):
+            logging.warning("[con-Cl@ve 2b] no scan within the hold window — retry next cycle")
+            _capture_diagnostics(driver, "clave-qr-timeout", context.save_artifacts)
+            return None
+        try:
+            _ = driver.current_url  # a dropped WebDriver also reads as "left the QR page"
+        except Exception:
+            logging.warning("[con-Cl@ve 2b] browser unreachable during the QR hold — retry next cycle")
+            return None
+        logging.info("[con-Cl@ve 2b] left the QR page — scan accepted, continuing")
+        time.sleep(random.uniform(2, 4))
+
     # ── Step 5: acEntrada — copy identity, set country, submit ──
     # acEntrada is PageState.PERSONAL_INFO (title "Rellene los campos...", #txtIdCitado).
     copiar_btn = find_element_resilient(driver, BTN_COPIAR, timeout=DELAY)
     if not copiar_btn:
         logging.error("Timed out waiting for acEntrada (btnCopiar) to load")
         _capture_diagnostics(driver, "copiar-not-found", context.save_artifacts)
+        # ICP "Su sesión ha caducado por permanecer demasiado tiempo inactiva" (infogenerica):
+        # a stale icp-domain session cookie (e.g. left over from a long QR wait) makes every
+        # Cl@ve return land here. Drop ONLY icp cookies (Cl@ve SSO on clave.gob.es survives).
+        try:
+            on_icp = "administracionelectronica" in (driver.current_url or "")
+        except Exception:
+            on_icp = False
+        if on_icp and "ha caducado" in (body_text(driver) or "").lower():
+            logging.warning("ICP session expired page — clearing icp-domain cookies, retry next cycle")
+            clear_icp_cookies(driver)
         return None
     # Reached acEntrada → the Cl@ve SSO worked this cycle; clear any stuck counter
     # (covers the warm-SSO path that skips the gateway block entirely).
@@ -1664,6 +1762,7 @@ def cycle_cita(
     if page_state == PageState.NO_APPOINTMENTS:
         logging.info("[con-Cl@ve 5] acCitar — no hay citas disponibles this cycle")
         _capture_no_citas_evidence(driver, "4010-clave")
+        _mark_good_check()
         context._rate_limit_count = 0  # clean cycle reached the citas page
         return None
     if page_state in (PageState.SLOT_SELECTION_TABLE, PageState.SLOT_SELECTION_5MIN):
