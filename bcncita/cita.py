@@ -207,7 +207,7 @@ def _shrink_png(png: bytes) -> bytes:
 
 # Screenshots per day, spread out: the day is split into EVIDENCE_PER_DAY equal
 # slots and only the first no-citas page in each slot is photographed. Every
-# check is still appended to index.jsonl (screenshot=null when skipped), so
+# check is still appended to index.jsonl (file=null when skipped), so
 # attempt counts stay complete.
 EVIDENCE_PER_DAY = int(os.environ.get("EVIDENCE_PER_DAY", "10"))
 _evidence_slots_taken = set()
