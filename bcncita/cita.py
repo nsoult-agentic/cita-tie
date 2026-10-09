@@ -319,6 +319,11 @@ _last_good_check = time.time()  # container start counts as the baseline
 _clave_alert_at = 0.0  # 0 = no outstanding login-lost alert
 _stale_alert_at = 0.0
 _last_qr_left = 0.0  # when the bot last left the QR page (= a scan or silent re-auth)
+# Set when a QR hold times out; cleared by a good check or a left QR page. The
+# hourly QR page usually clears on the NEXT attempt without a scan (seen
+# 2026-10-09 21:39->21:40 and 22:40->22:42), so only a QR on the attempt AFTER
+# a timeout means the login is really gone.
+_qr_timeout_pending = False
 
 
 def _in_quiet_hours() -> bool:
@@ -391,8 +396,9 @@ def _alert_clave_needed(reason: str):
 
 def _mark_good_check():
     """Called when a cycle reaches the real cita result page (Cl@ve worked end to end)."""
-    global _last_good_check, _clave_alert_at, _stale_alert_at
+    global _last_good_check, _clave_alert_at, _stale_alert_at, _qr_timeout_pending
     _last_good_check = time.time()
+    _qr_timeout_pending = False
     if _clave_alert_at and not _in_quiet_hours():
         _ntfy("Cl@ve login OK", "Cita checks are running again.", priority="default", tags="white_check_mark")
     _clave_alert_at = 0.0
@@ -1710,8 +1716,10 @@ def cycle_cita(
     # screen so a scan can complete (the old 30s element wait abandoned it). ──
     if _on_clave_qr_page(driver):
         logging.warning(f"[con-Cl@ve 2b] Cl@ve login expired — on the QR page; holding up to {CLAVE_QR_WAIT_S}s for a scan")
-        _clave_event("qr_shown", driver)
-        _alert_clave_needed("Cl@ve login expired")
+        global _qr_timeout_pending
+        _clave_event("qr_shown", driver, after_timeout=_qr_timeout_pending)
+        if _qr_timeout_pending:
+            _alert_clave_needed("Cl@ve login lost (QR again on the retry after a timed-out QR)")
         _qr_start = time.time()
         deadline = _qr_start + CLAVE_QR_WAIT_S
         while time.time() < deadline and _on_clave_qr_page(driver):
@@ -1719,6 +1727,7 @@ def cycle_cita(
         if _on_clave_qr_page(driver):
             logging.warning("[con-Cl@ve 2b] no scan within the hold window — retry next cycle")
             _clave_event("qr_timeout", waited_s=int(time.time() - _qr_start))
+            _qr_timeout_pending = True
             _capture_diagnostics(driver, "clave-qr-timeout", context.save_artifacts)
             return None
         try:
@@ -1730,6 +1739,7 @@ def cycle_cita(
         global _last_qr_left
         _clave_event("qr_left", waited_s=int(time.time() - _qr_start), quiet=_in_quiet_hours())
         _last_qr_left = time.time()
+        _qr_timeout_pending = False
         time.sleep(random.uniform(2, 4))
 
     # ── Step 5: acEntrada — copy identity, set country, submit ──
