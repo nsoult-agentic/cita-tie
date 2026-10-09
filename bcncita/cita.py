@@ -775,6 +775,9 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
                 f"[METRICS] cycle={i+1} result={_classify_result(result, driver)} "
                 f"duration_s={_cycle_dur:.1f} rate_limit_count={_rl_count} first_load={_fl}"
             )
+            # Watchdog per cycle too: an expired login holds ~4 min per cycle, so a
+            # long HOT run would otherwise delay the between-runs stale check by hours.
+            check_stale_and_alert()
         except KeyboardInterrupt:
             raise
         except TimeoutException:
@@ -1660,6 +1663,11 @@ def cycle_cita(
         if _on_clave_qr_page(driver):
             logging.warning("[con-Cl@ve 2b] no scan within the hold window — retry next cycle")
             _capture_diagnostics(driver, "clave-qr-timeout", context.save_artifacts)
+            return None
+        try:
+            _ = driver.current_url  # a dropped WebDriver also reads as "left the QR page"
+        except Exception:
+            logging.warning("[con-Cl@ve 2b] browser unreachable during the QR hold — retry next cycle")
             return None
         logging.info("[con-Cl@ve 2b] left the QR page — scan accepted, continuing")
         time.sleep(random.uniform(2, 4))
