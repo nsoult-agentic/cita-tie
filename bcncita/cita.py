@@ -308,9 +308,57 @@ CLAVE_ALERT_REPEAT_S = int(os.environ.get("CLAVE_ALERT_REPEAT_S", "3600"))
 STALE_ALERT_S = int(os.environ.get("STALE_ALERT_S", "7200"))
 NOVNC_URL = os.environ.get("NOVNC_URL", "http://172.16.10.25:7900")
 
+# Quiet hours (container local time, TZ=Europe/Madrid): no Cl@ve/stale pushes
+# from ALERT_QUIET_START to ALERT_QUIET_END. Checks keep running; the first
+# alert after quiet hours ends fires normally if the problem is still there.
+ALERT_QUIET_START = int(os.environ.get("ALERT_QUIET_START", "0"))
+ALERT_QUIET_END = int(os.environ.get("ALERT_QUIET_END", "11"))
+CLAVE_EVENTS_FILE = os.environ.get("CLAVE_EVENTS_FILE", "/app/data/clave-events.jsonl")
+
 _last_good_check = time.time()  # container start counts as the baseline
 _clave_alert_at = 0.0  # 0 = no outstanding login-lost alert
 _stale_alert_at = 0.0
+_last_qr_left = 0.0  # when the bot last left the QR page (= a scan or silent re-auth)
+
+
+def _in_quiet_hours() -> bool:
+    h = dt.now().hour
+    if ALERT_QUIET_START <= ALERT_QUIET_END:
+        return ALERT_QUIET_START <= h < ALERT_QUIET_END
+    return h >= ALERT_QUIET_START or h < ALERT_QUIET_END
+
+
+def _clave_event(event: str, driver=None, **fields):
+    """Append one Cl@ve login event to CLAVE_EVENTS_FILE (persists across redeploys).
+
+    Records cookie NAMES and expiry times for the current domain only — never values.
+    """
+    rec = {"time": dt.now().astimezone().isoformat(timespec="seconds"), "event": event}
+    rec.update(fields)
+    if _last_qr_left:
+        rec["s_since_qr_left"] = int(time.time() - _last_qr_left)
+    if driver is not None:
+        try:
+            rec["url_host"] = urllib.parse.urlparse(driver.current_url or "").hostname
+            rec["cookies"] = [
+                {
+                    "name": c.get("name"),
+                    "domain": c.get("domain"),
+                    "expires": (
+                        dt.fromtimestamp(c["expiry"]).astimezone().isoformat(timespec="seconds")
+                        if c.get("expiry") else "session"
+                    ),
+                }
+                for c in driver.get_cookies()
+            ]
+        except Exception:
+            pass
+    logging.info(f"[CLAVE] {event} " + " ".join(f"{k}={v}" for k, v in fields.items()))
+    try:
+        with open(CLAVE_EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logging.error(f"[CLAVE] event log write failed: {e}")
 
 
 def _on_clave_qr_page(driver) -> bool:
@@ -326,6 +374,9 @@ def _alert_clave_needed(reason: str):
     """Push "scan the QR" — immediately the first time, then at most every CLAVE_ALERT_REPEAT_S."""
     global _clave_alert_at
     now = time.time()
+    if _in_quiet_hours():
+        logging.info(f"Cl@ve alert suppressed (quiet hours {ALERT_QUIET_START:02d}-{ALERT_QUIET_END:02d}): {reason}")
+        return
     if _clave_alert_at and now - _clave_alert_at < CLAVE_ALERT_REPEAT_S:
         return
     _clave_alert_at = now
@@ -342,7 +393,7 @@ def _mark_good_check():
     """Called when a cycle reaches the real cita result page (Cl@ve worked end to end)."""
     global _last_good_check, _clave_alert_at, _stale_alert_at
     _last_good_check = time.time()
-    if _clave_alert_at:
+    if _clave_alert_at and not _in_quiet_hours():
         _ntfy("Cl@ve login OK", "Cita checks are running again.", priority="default", tags="white_check_mark")
     _clave_alert_at = 0.0
     _stale_alert_at = 0.0
@@ -353,7 +404,7 @@ def check_stale_and_alert():
     global _stale_alert_at
     now = time.time()
     idle = now - _last_good_check
-    if idle < STALE_ALERT_S:
+    if idle < STALE_ALERT_S or _in_quiet_hours():
         return
     if _stale_alert_at and now - _stale_alert_at < CLAVE_ALERT_REPEAT_S:
         return
@@ -1598,6 +1649,7 @@ def cycle_cita(
     post_clave_text = None
     if "pasarela.clave.gob.es" in cur_url:
         logging.info("[con-Cl@ve 2] On Cl@ve gateway — selecting Cl@ve Móvil (IDP_MOVIL)")
+        _clave_event("gateway", driver)
         idp_btn = find_element_resilient(driver, IDP_MOVIL_BUTTON, timeout=DELAY)
         if idp_btn:
             _real_click(driver, idp_btn)
@@ -1643,6 +1695,8 @@ def cycle_cita(
             return None
         # Cl@ve carried through → SSO is alive; clear the stuck counter.
         context._clave_stuck_count = 0
+        if not _on_clave_qr_page(driver):
+            _clave_event("gateway_passed_no_qr", driver)
 
     # ── F5 / 429 self-heal check after the Cl@ve hop ──
     # Reuse the body already read after the Cl@ve hop (avoids a redundant body_text +
@@ -1656,12 +1710,15 @@ def cycle_cita(
     # screen so a scan can complete (the old 30s element wait abandoned it). ──
     if _on_clave_qr_page(driver):
         logging.warning(f"[con-Cl@ve 2b] Cl@ve login expired — on the QR page; holding up to {CLAVE_QR_WAIT_S}s for a scan")
+        _clave_event("qr_shown", driver)
         _alert_clave_needed("Cl@ve login expired")
-        deadline = time.time() + CLAVE_QR_WAIT_S
+        _qr_start = time.time()
+        deadline = _qr_start + CLAVE_QR_WAIT_S
         while time.time() < deadline and _on_clave_qr_page(driver):
             time.sleep(5)
         if _on_clave_qr_page(driver):
             logging.warning("[con-Cl@ve 2b] no scan within the hold window — retry next cycle")
+            _clave_event("qr_timeout", waited_s=int(time.time() - _qr_start))
             _capture_diagnostics(driver, "clave-qr-timeout", context.save_artifacts)
             return None
         try:
@@ -1670,6 +1727,9 @@ def cycle_cita(
             logging.warning("[con-Cl@ve 2b] browser unreachable during the QR hold — retry next cycle")
             return None
         logging.info("[con-Cl@ve 2b] left the QR page — scan accepted, continuing")
+        global _last_qr_left
+        _clave_event("qr_left", waited_s=int(time.time() - _qr_start), quiet=_in_quiet_hours())
+        _last_qr_left = time.time()
         time.sleep(random.uniform(2, 4))
 
     # ── Step 5: acEntrada — copy identity, set country, submit ──
@@ -1763,6 +1823,7 @@ def cycle_cita(
         logging.info("[con-Cl@ve 5] acCitar — no hay citas disponibles this cycle")
         _capture_no_citas_evidence(driver, "4010-clave")
         _mark_good_check()
+        _clave_event("good_check")
         context._rate_limit_count = 0  # clean cycle reached the citas page
         return None
     if page_state in (PageState.SLOT_SELECTION_TABLE, PageState.SLOT_SELECTION_5MIN):
