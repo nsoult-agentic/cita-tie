@@ -555,6 +555,12 @@ def main():
             time.sleep(hold_s)
             continue
 
+        # Watchdog: push if no cycle has reached the cita page for STALE_ALERT_S.
+        try:
+            _cita_mod.check_stale_and_alert()
+        except Exception as e:
+            log.error(f"stale-check failed: {e}")
+
         # Periodic heartbeat
         if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
             _ntfy("TIE Checker Status", _heartbeat_summary(), ntfy_config, priority="low", tags="chart_with_upwards_trend")
