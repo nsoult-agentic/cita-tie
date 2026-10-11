@@ -68,6 +68,18 @@ speaker = new_speaker()
 
 
 # PAI: classify cycle result for metrics logging
+# acCitar: how long to re-check a not-yet-recognised page, and how long to hold
+# an unrecognised one (possible offer) before the next cycle navigates away.
+ACCITAR_SETTLE_S = float(os.environ.get("ACCITAR_SETTLE_S", "10"))
+ACCITAR_HOLD_S = float(os.environ.get("ACCITAR_HOLD_S", "240"))
+_ACCITAR_KNOWN_STATES = (
+    PageState.RATE_LIMITED,
+    PageState.NO_APPOINTMENTS,
+    PageState.SLOT_SELECTION_TABLE,
+    PageState.SLOT_SELECTION_5MIN,
+)
+
+
 def _classify_result(result, driver):
     """Return a short label for the cycle outcome based on result and last log."""
     if result is True:
@@ -75,6 +87,11 @@ def _classify_result(result, driver):
     # Check recent page state for more detail
     try:
         ps = detect_page_state(driver)
+        # The first page (citar?p=8) contains "no hay citas" in its info text, so
+        # a cycle that stalled there would read as NO_APPOINTMENTS. Only acCitar
+        # proves there were no citas.
+        if ps == PageState.NO_APPOINTMENTS and "acCitar" not in (driver.current_url or ""):
+            return "INCOMPLETE"
         return ps.name
     except Exception:
         return "ERROR"
@@ -1856,8 +1873,15 @@ def cycle_cita(
         logging.warning(f"Expected acValidarEntrada, got {page_state.name} — continuing to classify acCitar")
 
     # ── Step 7: acCitar — classify outcome ──
-    resp_text = body_text(driver)
-    page_state = detect_page_state(driver, resp_text)
+    # Re-check until the page is recognised: a single check 1-2.5 s after the
+    # click has judged a still-loading acCitar as UNKNOWN (2026-10-12 00:29).
+    deadline = time.time() + ACCITAR_SETTLE_S
+    while True:
+        resp_text = body_text(driver)
+        page_state = detect_page_state(driver, resp_text)
+        if page_state in _ACCITAR_KNOWN_STATES or time.time() >= deadline:
+            break
+        time.sleep(1)
 
     if page_state == PageState.RATE_LIMITED:
         return _handle_rate_limit(driver, context, resp_text, "accitar")
@@ -1873,10 +1897,44 @@ def cycle_cita(
         context._rate_limit_count = 0
         return cita_selection(driver, context)
 
-    # Anything else is unexpected — capture it so we can refine.
+    # Anything else is unexpected. The slot parser has never seen a real offer
+    # page from the automatic run, so an unrecognised acCitar may be an offer:
+    # alert, save the page, and hold it so it can be taken over via noVNC.
     logging.warning(f"[con-Cl@ve 5] acCitar — unexpected state {page_state.name}")
     _capture_diagnostics(driver, "accitar-unexpected", context.save_artifacts)
+    _alert_possible_offer(driver, page_state, resp_text)
     return None
+
+
+def _alert_possible_offer(driver: webdriver, page_state, resp_text: str):
+    """Unrecognised acCitar page: save screenshot + HTML, send an urgent ntfy,
+    log the page DOM, then hold the page ACCITAR_HOLD_S before the next cycle
+    navigates away."""
+    ts = dt.now().strftime("%Y%m%d-%H%M%S")
+    base = f"/app/data/accitar-unknown-{ts}"
+    try:
+        driver.save_screenshot(f"{base}.png")
+        with open(f"{base}.html", "w", encoding="utf-8") as f:
+            f.write(driver.page_source or "")
+    except Exception as e:
+        logging.error(f"[con-Cl@ve 5] acCitar page capture failed: {e}")
+    try:
+        url, title = driver.current_url, driver.title
+    except Exception:
+        url, title = "?", "?"
+    snippet = " ".join((resp_text or "").split())[:300]
+    _ntfy(
+        "POSSIBLE CITA - check now",
+        f"acCitar page not recognised (state={page_state.name}). It may be an offer. "
+        f"Page held {ACCITAR_HOLD_S:.0f}s on noVNC :7900.\n"
+        f"Title: {title}\nURL: {url}\nText: {snippet}\nScreenshot: {base}.png",
+        priority="urgent",
+        tags="rotating_light",
+    )
+    _log_offer_dom(driver)
+    if ACCITAR_HOLD_S > 0:
+        logging.warning(f"[con-Cl@ve 5] holding acCitar page {ACCITAR_HOLD_S:.0f}s for manual takeover")
+        time.sleep(ACCITAR_HOLD_S)
 
 
 def _log_offer_dom(driver: webdriver):
