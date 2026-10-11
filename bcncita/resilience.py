@@ -23,6 +23,13 @@ log = logging.getLogger("resilience")
 # ── Fallback tracking ───────────────────────────────────────────────
 
 _fallback_hits: dict = {}
+# name -> screenshot path of the first capture this cycle (one capture per
+# selector per cycle, so a repeating fallback does not fill the disk)
+_fallback_captures: dict = {}
+
+# Top-level /app/data so cleanup_old_screenshots() in run.py ages them out
+# (the HTML can hold autofilled personal data).
+FALLBACK_DIAG_DIR = "/app/data"
 
 
 def find_element_resilient(
@@ -61,13 +68,13 @@ def find_element_resilient(
                     )
                     els = driver.find_elements(by, value)
                     if els:
-                        _record_fallback(descriptor.name, by, value)
+                        _record_fallback(descriptor.name, by, value, driver)
                         return els
                 else:
                     el = WebDriverWait(driver, fallback_wait).until(
                         EC.presence_of_element_located((by, value))
                     )
-                    _record_fallback(descriptor.name, by, value)
+                    _record_fallback(descriptor.name, by, value, driver)
                     return el
         except Exception:
             continue
@@ -87,21 +94,63 @@ def find_elements_resilient(
     return result if result else []
 
 
-def _record_fallback(name: str, by: str, value: str):
+def _page_context(driver: WebDriver) -> str:
+    """URL, title and the start of the body text, for a log line."""
+    try:
+        url = driver.current_url
+        title = driver.title
+        body = ""
+        try:
+            body = driver.find_element("tag name", "body").text[:300].replace("\n", " | ")
+        except Exception:
+            pass
+        return f"url={url} title={title!r} body={body!r}"
+    except Exception as e:
+        return f"(page context unavailable: {e})"
+
+
+def _capture_fallback(driver: WebDriver, name: str) -> Optional[str]:
+    """Save screenshot + rendered HTML of the page a fallback matched on."""
+    ts = dt.now().strftime("%Y%m%d-%H%M%S")
+    base = f"{FALLBACK_DIAG_DIR}/fallback-{name}-{ts}"
+    try:
+        driver.save_screenshot(f"{base}.png")
+        with open(f"{base}.html", "w", encoding="utf-8") as f:
+            f.write(driver.page_source or "")
+        return f"{base}.png"
+    except Exception as e:
+        log.warning(f"FALLBACK capture failed for '{name}': {e}")
+        return None
+
+
+def _record_fallback(name: str, by: str, value: str, driver: Optional[WebDriver] = None):
     count = _fallback_hits.get(name, (None, None, 0))[2]
     _fallback_hits[name] = (by, value, count + 1)
     log.warning(f"FALLBACK: '{name}' found via ({by}, '{value}') — update selectors.py")
+    if driver is None:
+        return
+    log.warning(f"FALLBACK: '{name}' page: {_page_context(driver)}")
+    if name not in _fallback_captures:
+        _fallback_captures[name] = _capture_fallback(driver, name)
+        if _fallback_captures[name]:
+            log.warning(f"FALLBACK: '{name}' screenshot: {_fallback_captures[name]} (+ .html)")
 
 
 def get_fallback_report() -> str:
     if not _fallback_hits:
         return ""
-    lines = [f"  {n}: {by}='{v}' ({c}x)" for n, (by, v, c) in _fallback_hits.items()]
+    lines = []
+    for n, (by, v, c) in _fallback_hits.items():
+        line = f"  {n}: {by}='{v}' ({c}x)"
+        if _fallback_captures.get(n):
+            line += f" — {_fallback_captures[n].rsplit('/', 1)[-1]}"
+        lines.append(line)
     return "Fallback selectors used:\n" + "\n".join(lines)
 
 
 def reset_fallback_tracking():
     _fallback_hits.clear()
+    _fallback_captures.clear()
 
 
 # ── Page State Detection ────────────────────────────────────────────
@@ -319,6 +368,7 @@ def submit_form_resilient(driver: WebDriver, js_function: str, fallback_descript
         return True
     except Exception as e:
         log.warning(f"JS call '{js_function}' failed: {e}")
+        log.warning(f"JS call '{js_function}' failed on page: {_page_context(driver)}")
 
     if fallback_descriptor:
         btn = find_element_resilient(driver, fallback_descriptor, timeout=3)
