@@ -46,6 +46,8 @@ from .resilience import (
     StepError,
     get_fallback_report,
     reset_fallback_tracking,
+    save_page,
+    url_no_query,
 )
 from .selectors import *
 
@@ -67,19 +69,22 @@ DELAY = 30
 speaker = new_speaker()
 
 
-# PAI: classify cycle result for metrics logging
-# acCitar: how long to re-check a not-yet-recognised page, and how long to hold
-# an unrecognised one (possible offer) before the next cycle navigates away.
+# acCitar: how long to re-check a not-yet-recognised page.
 ACCITAR_SETTLE_S = float(os.environ.get("ACCITAR_SETTLE_S", "10"))
-ACCITAR_HOLD_S = float(os.environ.get("ACCITAR_HOLD_S", "240"))
-_ACCITAR_KNOWN_STATES = (
-    PageState.RATE_LIMITED,
-    PageState.NO_APPOINTMENTS,
-    PageState.SLOT_SELECTION_TABLE,
-    PageState.SLOT_SELECTION_5MIN,
-)
+# Possible-offer park (run.py): leave the browser on the page this long, with
+# no driver calls (a WebDriver call would dismiss an open ICP+ confirm dialog
+# under a human booking on noVNC). PAUSE keeps it parked for longer.
+ACCITAR_OFFER_HOLD_S = float(os.environ.get("ACCITAR_OFFER_HOLD_S", "1800"))
+# At most one push of each kind (urgent possible offer, unexpected page) per this many seconds.
+ALERT_DEDUPE_S = float(os.environ.get("ALERT_DEDUPE_S", "600"))
+_OFFER_STATES = (PageState.SLOT_SELECTION_TABLE, PageState.SLOT_SELECTION_5MIN)
+_ACCITAR_KNOWN_STATES = (PageState.RATE_LIMITED, PageState.NO_APPOINTMENTS, *_OFFER_STATES)
+# Element ids that only appear when citas are offered (office list, slot table).
+_OFFER_ELEMENT_IDS = ("idSede", "CitaMAP_HORAS")
+_last_alert: Dict[str, float] = {}
 
 
+# PAI: classify cycle result for metrics logging
 def _classify_result(result, driver):
     """Return a short label for the cycle outcome based on result and last log."""
     if result is True:
@@ -148,33 +153,19 @@ def fingerprint_test():
 
 # PAI: diagnostic capture on any failure — screenshot + page state + context
 def _capture_diagnostics(driver: webdriver, label: str, save_artifacts: bool = True):
-    """Log page state, URL, title, and first 500 chars of body text. Save screenshot."""
+    """Log URL (no query), title and page state; save screenshot + HTML.
+    Body text and page source are not logged (pages show the NIE/name); they
+    are in the saved .html, which cleanup ages out."""
     try:
-        url = driver.current_url
-        title = driver.title
-        page_state = detect_page_state(driver)
-        body = ""
+        logging.error(f"[DIAG:{label}] URL: {url_no_query(driver.current_url)}")
+        logging.error(f"[DIAG:{label}] Title: {driver.title}")
+        logging.error(f"[DIAG:{label}] PageState: {detect_page_state(driver)}")
         try:
-            body_el = driver.find_element(By.TAG_NAME, "body")
-            body = body_el.text[:500] if body_el else ""
-        except Exception:
-            pass
-        logging.error(f"[DIAG:{label}] URL: {url}")
-        logging.error(f"[DIAG:{label}] Title: {title}")
-        logging.error(f"[DIAG:{label}] PageState: {page_state}")
-        if body:
-            logging.error(f"[DIAG:{label}] Body (500): {body[:500]}")
-        try:
-            page_source = driver.page_source
-            source_len = len(page_source) if page_source else 0
-            logging.error(f"[DIAG:{label}] page_source_len: {source_len}")
-            if source_len < 2000:
-                logging.error(f"[DIAG:{label}] page_source: {page_source}")
+            logging.error(f"[DIAG:{label}] page_source_len: {len(driver.page_source or '')}")
         except Exception:
             pass
         if save_artifacts:
-            ts = dt.now().strftime("%Y%m%d-%H%M%S")
-            driver.save_screenshot(f"/app/data/diag-{label}-{ts}.png")
+            save_page(driver, f"diag-{label}")
     except Exception as e:
         logging.error(f"[DIAG:{label}] Diagnostic capture failed: {e}")
 
@@ -468,7 +459,9 @@ def check_stale_and_alert():
     _ntfy(
         "No cita checks working",
         f"No check has reached the cita page for {idle / 3600:.1f}h (last good: {since}). "
-        f"Check the Cl@ve login at {NOVNC_URL} and the bot logs.",
+        + ("The bot is PAUSED via /control/probe?cmd=pause; resume it with cmd=resume."
+           if PAUSE.is_set() else
+           f"Check the Cl@ve login at {NOVNC_URL} and the bot logs."),
         priority="urgent",
         tags="rotating_light",
     )
@@ -814,6 +807,17 @@ def init_wedriver(context: CustomerProfile):
 # page long enough for a human to finish the booking via /control.
 LAST_4047_OFFER = False
 
+# Set True by the acCitar step when the page is or may be an offer and was not
+# booked; start_with stops its cycles and run.py parks the browser on it.
+# _parked_driver is kept so a local (non-remote) Firefox can be quit afterwards.
+LAST_4010_OFFER = False
+_parked_driver = None
+
+# Set/cleared by run.py's /control/probe?cmd=pause|resume. While set, no cycle
+# starts and the inter-cycle wait ends early, so a human on the shared browser
+# is not navigated away (a walk already in progress still finishes).
+PAUSE = threading.Event()
+
 
 def try_cita(context: CustomerProfile, cycles: int = CYCLES):
     driver = init_wedriver(context)
@@ -827,6 +831,8 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
         )
     if context.sms_webhook_token:
         delete_message(context.sms_webhook_token)
+    # Also reset here: the end-of-run reset is skipped if a run raises.
+    reset_fallback_tracking()
 
     operation_category = "icpplus"
     operation_param = "tramiteGrupo[1]"
@@ -859,6 +865,8 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
     success = False
     result = None
     for i in range(cycles):
+        if LAST_4010_OFFER or PAUSE.is_set():
+            break
         result = None  # reset per iteration — a TimeoutException must not reuse a stale result
         try:
             _ = driver.title
@@ -878,7 +886,8 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
             _fl = getattr(context, 'first_load', True)
             # PAI: structured metrics for experiment analysis
             logging.info(
-                f"[METRICS] cycle={i+1} result={_classify_result(result, driver)} "
+                f"[METRICS] cycle={i+1} "
+                f"result={'POSSIBLE_OFFER' if LAST_4010_OFFER else _classify_result(result, driver)} "
                 f"duration_s={_cycle_dur:.1f} rate_limit_count={_rl_count} first_load={_fl}"
             )
             # Watchdog per cycle too: an expired login holds ~4 min per cycle, so a
@@ -906,11 +915,16 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
             )
             break
 
+        if LAST_4010_OFFER:
+            logging.warning("Possible offer on acCitar — stopping cycles; run.py parks the browser")
+            break
+
         # PAI: gentle inter-cycle pacing. Back-to-back con-Cl@ve walks (~8 gov
         # requests each) trip the F5 "Request Rejected" WAF; ~60-90s spacing kept
         # the host poller clean for hours. Skip after the last cycle.
-        if i < cycles - 1:
-            time.sleep(random.uniform(55, 90))
+        if i < cycles - 1 and PAUSE.wait(timeout=random.uniform(55, 90)):
+            logging.info("Paused via /control — stopping cycles")
+            break
 
     if not success:
         logging.error("FAIL - all cycles exhausted")
@@ -922,7 +936,7 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
     # needs no Cl@ve (no QR), so it runs unattended in the active loop. It is
     # detect-only and never books. On an offer it sets LAST_4047_OFFER so run.py
     # parks the browser on the offer page.
-    if (not success and os.environ.get("PROBE_4047", "").lower() == "true"
+    if (not success and not LAST_4010_OFFER and not PAUSE.is_set() and os.environ.get("PROBE_4047", "").lower() == "true"
             and context.province == Province.BARCELONA):
         # Space out from the last con-Cl@ve walk so the extra ~6 requests don't
         # trip the F5 "Request Rejected" WAF — match the proven inter-cycle
@@ -955,7 +969,8 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
     # session and kills the warm Cl@ve browser, forcing a QR re-scan. Only quit a
     # locally-spawned Firefox. In remote/reattach mode (WEBDRIVER_URL set) the
     # long-lived cita-browser session must persist across try_cita() calls.
-    if not os.environ.get("WEBDRIVER_URL"):
+    # Also keep a local browser parked on a possible offer (run.py holds it).
+    if not os.environ.get("WEBDRIVER_URL") and not LAST_4010_OFFER:
         try:
             driver.quit()
         except Exception:
@@ -1380,14 +1395,8 @@ def office_selection(driver: webdriver, context: CustomerProfile):
             # PAI DIAG: capture the EXACT page (screenshot + full rendered HTML +
             # URL) to settle whether this is a genuine no-citas page (trámite not
             # registered) or a real availability page being misread.
-            try:
-                ts = dt.now().strftime("%Y%m%d-%H%M%S")
-                driver.save_screenshot(f"/app/data/no-appointments-{ts}.png")
-                with io.open(f"/app/data/no-appointments-{ts}.html", "w", encoding="utf-8") as f:
-                    f.write(driver.page_source or "")
-                logging.info(f"[DIAG:no-appointments] url={driver.current_url} saved no-appointments-{ts}.png/.html")
-            except Exception as e:
-                logging.error(f"[DIAG:no-appointments] capture failed: {e}")
+            saved = save_page(driver, "no-appointments")
+            logging.info(f"[DIAG:no-appointments] saved={saved}")
             return None
         elif page_state == PageState.RATE_LIMITED:
             logging.warning("Rate limited during office selection — aborting cycle")
@@ -1511,10 +1520,19 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
             logging.error(f"sede/trámite selection failed: {e}")
             return
         time.sleep(random.uniform(0.8, 1.8))
+        # envia() lives in icp-*.min.js, which loads after the F5 TSPD scripts.
+        # Calling it early raised "envia is not defined"; the old fallback then
+        # clicked the portada's own Aceptar button (#btnAceptar, onclick=envia()),
+        # which fails the same way (fallback-btn_entrar capture, 2026-10-12).
         try:
+            WebDriverWait(driver, 15).until(
+                lambda d: d.execute_script("return typeof envia === 'function'")
+            )
             driver.execute_script("envia();")
-        except Exception:
-            submit_form_resilient(driver, "envia();", BTN_ENTRAR)
+        except Exception as e:
+            logging.warning(f"portada: envia() not available/failed (attempt {attempt + 1}): "
+                            f"{str(e).splitlines()[0] if str(e) else type(e).__name__}")
+            continue
         time.sleep(random.uniform(2, 4))
         # Dismiss the "Por favor, selecciona un trámite" modal if it appears
         try:
@@ -1875,10 +1893,14 @@ def cycle_cita(
     # ── Step 7: acCitar — classify outcome ──
     # Re-check until the page is recognised: a single check 1-2.5 s after the
     # click has judged a still-loading acCitar as UNKNOWN (2026-10-12 00:29).
+    # "no hay citas" also appears in the first page's info text, so it only
+    # counts on the acCitar URL with no office list or slot table on the page.
     deadline = time.time() + ACCITAR_SETTLE_S
     while True:
         resp_text = body_text(driver)
         page_state = detect_page_state(driver, resp_text)
+        if page_state == PageState.NO_APPOINTMENTS and not _is_accitar_no_citas(driver):
+            page_state = PageState.UNKNOWN
         if page_state in _ACCITAR_KNOWN_STATES or time.time() >= deadline:
             break
         time.sleep(1)
@@ -1892,74 +1914,140 @@ def cycle_cita(
         _clave_event("good_check")
         context._rate_limit_count = 0  # clean cycle reached the citas page
         return None
-    if page_state in (PageState.SLOT_SELECTION_TABLE, PageState.SLOT_SELECTION_5MIN):
+    if page_state in _OFFER_STATES:
         logging.info(f"[con-Cl@ve 5] acCitar — OFFER PAGE ({page_state.name})! Handing off to cita_selection")
         context._rate_limit_count = 0
-        return cita_selection(driver, context)
+        # Park unless the booking completes — also if cita_selection raises.
+        _mark_offer_parked(driver)
+        result = None
+        try:
+            result = cita_selection(driver, context)
+            return result
+        finally:
+            if result:
+                _clear_offer_park()
+            else:
+                try:
+                    url = url_no_query(driver.current_url)
+                except Exception:
+                    url = ""
+                _urgent_offer_push(
+                    f"Slot page seen ({page_state.name}) but automatic booking did not finish.",
+                    url, "",
+                )
 
     # Anything else is unexpected. The slot parser has never seen a real offer
-    # page from the automatic run, so an unrecognised acCitar may be an offer:
-    # alert, save the page, and hold it so it can be taken over via noVNC.
+    # page from the automatic run, so an unrecognised acCitar may be an offer.
     logging.warning(f"[con-Cl@ve 5] acCitar — unexpected state {page_state.name}")
-    _capture_diagnostics(driver, "accitar-unexpected", context.save_artifacts)
-    _alert_possible_offer(driver, page_state, resp_text)
+    _handle_unexpected_accitar(driver, page_state)
     return None
 
 
-def _alert_possible_offer(driver: webdriver, page_state, resp_text: str):
-    """Unrecognised acCitar page: save screenshot + HTML, send an urgent ntfy,
-    log the page DOM, then hold the page ACCITAR_HOLD_S before the next cycle
-    navigates away."""
-    ts = dt.now().strftime("%Y%m%d-%H%M%S")
-    base = f"/app/data/accitar-unknown-{ts}"
+def _is_accitar_no_citas(driver: webdriver) -> bool:
+    """True only on the real acCitar page with no office list / slot table."""
     try:
-        driver.save_screenshot(f"{base}.png")
-        with open(f"{base}.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source or "")
+        if "acCitar" not in (driver.current_url or ""):
+            return False
+        # Visible only: a hidden form field with the same id must not turn every
+        # clean check into a park (the acCitar markup is unverified).
+        return not any(e.is_displayed() for i in _OFFER_ELEMENT_IDS
+                       for e in driver.find_elements(By.ID, i))
     except Exception as e:
-        logging.error(f"[con-Cl@ve 5] acCitar page capture failed: {e}")
-    try:
-        url, title = driver.current_url, driver.title
-    except Exception:
-        url, title = "?", "?"
-    snippet = " ".join((resp_text or "").split())[:300]
+        logging.warning(f"[con-Cl@ve 5] no-citas check failed: {str(e).splitlines()[0] if str(e) else e!r}")
+        return False
+
+
+def _mark_offer_parked(driver: webdriver):
+    global LAST_4010_OFFER, _parked_driver
+    LAST_4010_OFFER, _parked_driver = True, driver
+
+
+def _clear_offer_park():
+    global LAST_4010_OFFER, _parked_driver
+    LAST_4010_OFFER, _parked_driver = False, None
+
+
+def release_offer_park():
+    """Called by run.py when the park ends: clear the flag; quit a local
+    Firefox (never the remote cita-browser session, which holds the Cl@ve login)."""
+    driver = _parked_driver
+    _clear_offer_park()
+    if driver is not None and not os.environ.get("WEBDRIVER_URL") and not PAUSE.is_set():
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+def _alert_allowed(kind: str) -> bool:
+    """At most one push per kind per ALERT_DEDUPE_S."""
+    now = time.time()
+    if now - _last_alert.get(kind, 0.0) < ALERT_DEDUPE_S:
+        return False
+    _last_alert[kind] = now
+    return True
+
+
+def _urgent_offer_push(reason: str, url: str, title: str, screenshot: str = ""):
+    if not _alert_allowed("urgent"):
+        logging.warning(f"[con-Cl@ve 5] urgent alert suppressed (one sent in the last {ALERT_DEDUPE_S:.0f}s); browser still parked")
+        return
     _ntfy(
         "POSSIBLE CITA - check now",
-        f"acCitar page not recognised (state={page_state.name}). It may be an offer. "
-        f"Page held {ACCITAR_HOLD_S:.0f}s on noVNC :7900.\n"
-        f"Title: {title}\nURL: {url}\nText: {snippet}\nScreenshot: {base}.png",
+        f"{reason} Browser parked on noVNC :7900 for {ACCITAR_OFFER_HOLD_S / 60:.0f} min. "
+        f"To keep it longer, ask the cita-tie agent to pause the bot (/control/probe?cmd=pause).\n"
+        f"Title: {title}\nURL: {url}" + (f"\nSaved: {screenshot}" if screenshot else ""),
         priority="urgent",
         tags="rotating_light",
     )
-    _log_offer_dom(driver)
-    if ACCITAR_HOLD_S > 0:
-        logging.warning(f"[con-Cl@ve 5] holding acCitar page {ACCITAR_HOLD_S:.0f}s for manual takeover")
-        time.sleep(ACCITAR_HOLD_S)
 
 
-def _log_offer_dom(driver: webdriver):
-    """PAI: we have NEVER captured a populated offer page. Log the raw offer-page
-    DOM (slot table outerHTML if present, else first ~8000 chars of page_source)
-    at INFO so the slot/office parser can be refined against real markup."""
+def _handle_unexpected_accitar(driver: webdriver, page_state):
+    """Unexpected page after Solicitar Cita. Save it and alert.
+    On the acCitar URL (and not an error page) it may be an offer: park the
+    browser and send an urgent push. Anywhere else: normal push, no park.
+    No page text goes into the push or the log (it shows the NIE and name)."""
     try:
-        table = driver.find_elements(By.CSS_SELECTOR, "#CitaMAP_HORAS")
-        if table:
-            html = table[0].get_attribute("outerHTML") or ""
-            logging.info(f"[OFFER-DOM] CitaMAP_HORAS outerHTML (first 8000):\n{html[:8000]}")
-        else:
-            src = driver.page_source or ""
-            logging.info(f"[OFFER-DOM] page_source (first 8000):\n{src[:8000]}")
-    except Exception as e:
-        logging.error(f"[OFFER-DOM] capture failed: {str(e).split(chr(10))[0]}")
+        url, title = driver.current_url or "", driver.title or ""
+    except Exception:
+        url, title = "", ""
+    on_accitar = "acCitar" in url
+    possible_offer = on_accitar and page_state not in (PageState.ERROR, PageState.RATE_LIMITED)
+    saved = save_page(driver, "accitar-unknown" if on_accitar else "after-solicitar-unknown")
+    logging.warning(
+        f"[con-Cl@ve 5] unexpected page: state={page_state.name} title={title!r} "
+        f"url={url_no_query(url)} saved={saved} possible_offer={possible_offer}"
+    )
+    if possible_offer:
+        _mark_offer_parked(driver)
+        _urgent_offer_push(
+            f"acCitar page not recognised (state={page_state.name}). It may be an offer.",
+            url_no_query(url), title, saved or "",
+        )
+    elif _alert_allowed("unexpected"):
+        _ntfy(
+            "cita-tie: unexpected page",
+            f"After Solicitar Cita: state={page_state.name}, title={title!r}, "
+            f"url={url_no_query(url)}. Not treated as an offer. Saved: {saved}",
+            priority="default",
+            tags="warning",
+        )
+
+
+def _save_offer_page(driver: webdriver):
+    """PAI: we have NEVER captured a populated offer page. Save it (screenshot +
+    HTML, aged out by cleanup) so the slot/office parser can be refined against
+    real markup. Not logged: the page shows the NIE/name."""
+    logging.info(f"[OFFER-DOM] offer page saved: {save_page(driver, 'offer-dom')}")
 
 
 def cita_selection(driver: webdriver, context: CustomerProfile):
     resp_text = body_text(driver)
     page_state = detect_page_state(driver, resp_text)
 
-    # PAI: dump the raw offer DOM before selecting (offer page is unverified).
-    if page_state in (PageState.SLOT_SELECTION_5MIN, PageState.SLOT_SELECTION_TABLE):
-        _log_offer_dom(driver)
+    # PAI: save the raw offer page before selecting (offer page is unverified).
+    if page_state in _OFFER_STATES:
+        _save_offer_page(driver)
 
     if page_state == PageState.SLOT_SELECTION_5MIN:
         logging.info("[Step 4/6] Cita attempt -> selection hit!")

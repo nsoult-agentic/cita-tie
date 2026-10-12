@@ -43,7 +43,7 @@ _stats = {
 
 
 # ── Remote orchestration state (manual control of one Selenium driver) ──
-_ctl = {"driver": None, "profile": None, "last_control": 0.0, "probe_pause": False}
+_ctl = {"driver": None, "profile": None, "last_control": 0.0}
 
 # Serializes access to the single driver between the /control API (human-driven
 # booking) and the unattended PROBE_4047 loop, so they never navigate mid-walk.
@@ -128,11 +128,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
         # status poll would keep resetting the idle guard and starve the probe.
         if cmd == "probe":
             sub = q.get("cmd", ["status"])[0]
+            from bcncita.cita import PAUSE
             if sub == "pause":
-                _ctl["probe_pause"] = True
+                PAUSE.set()
             elif sub == "resume":
-                _ctl["probe_pause"] = False
-            return self._cjson({"ok": True, "probe_pause": _ctl["probe_pause"]})
+                PAUSE.clear()
+            return self._cjson({"ok": True, "probe_pause": PAUSE.is_set()})
         _ctl["last_control"] = time.time()
         if not _ctl_lock.acquire(timeout=120):
             return self._cjson({"error": "driver busy (probe walk in progress)"}, 503)
@@ -404,11 +405,12 @@ def _ntfy(title, message, ntfy_config_raw, priority="default", tags=""):
 
 def cleanup_old_screenshots(data_dir="/app/data", max_age_days=7):
     """Delete screenshots older than max_age_days to prevent PII accumulation.
-    Top-level *.png (and fallback-*.html) only: the no-citas evidence record
-    under /app/data/evidence/ is kept on purpose and must not be globbed here."""
+    Top-level *.png and *.html only (saved pages can hold the NIE/name): the
+    no-citas evidence record under /app/data/evidence/ is kept on purpose and
+    must not be globbed here (glob is non-recursive)."""
     cutoff = time.time() - (max_age_days * 86400)
     data = pathlib.Path(data_dir)
-    for f in [*data.glob("*.png"), *data.glob("fallback-*.html")]:
+    for f in [*data.glob("*.png"), *data.glob("*.html")]:
         try:
             if f.stat().st_mtime < cutoff:
                 f.unlink()
@@ -456,7 +458,7 @@ def main():
         # offer for step-by-step /control finishing (captcha + SMS).
         probe_4047 = os.environ.get("PROBE_4047", "").lower() == "true" and _ctl.get("profile") is not None
         if probe_4047:
-            from bcncita.cita import probe_4047_sinclave
+            from bcncita.cita import probe_4047_sinclave, PAUSE
             from bcncita.cita import _ntfy as _cita_ntfy
             log.info("PROBE_4047: unattended sin-Cl@ve polling of the 4047 queue ENABLED")
         while True:
@@ -470,7 +472,7 @@ def main():
             # can't prevent the probe from clobbering a live booking. The idle
             # guard is only a secondary backstop against grabbing the driver
             # while a human is actively clicking.
-            if _ctl.get("probe_pause") or (time.time() - _ctl.get("last_control", 0.0) < CONTROL_IDLE_GUARD):
+            if PAUSE.is_set() or (time.time() - _ctl.get("last_control", 0.0) < CONTROL_IDLE_GUARD):
                 time.sleep(20)
                 continue
             outcome = "ERROR"
@@ -502,7 +504,6 @@ def main():
     _start_health_server(port=int(os.environ.get("SMS_CODE_PORT", "8080")))
 
     profile, ntfy_config = build_profile()
-    cleanup_old_screenshots()
 
     _ntfy(
         "TIE Checker Started",
@@ -515,6 +516,21 @@ def main():
     last_heartbeat = time.time()
 
     while True:
+        # /control/probe?cmd=pause also pauses the 4010 loop (and stops a run's
+        # cycles, see PAUSE in bcncita.cita), so a human booking on the shared
+        # browser is not navigated away. The stale watchdog keeps running, so a
+        # forgotten pause still raises "No cita checks working".
+        import bcncita.cita as _cita_mod
+        if _cita_mod.PAUSE.is_set():
+            _stats["last_state"] = "paused via /control/probe"
+            try:
+                _cita_mod.check_stale_and_alert()
+            except Exception as e:
+                log.error(f"stale-check failed: {e}")
+            time.sleep(20)
+            continue
+        cleanup_old_screenshots()  # every run: the process can stay up for weeks
+
         hot = is_hot_window()
         cycles = HOT_CYCLES if hot else COLD_CYCLES
         sleep_time = HOT_SLEEP if hot else COLD_SLEEP
@@ -547,13 +563,22 @@ def main():
         # offer, keep the browser parked on it (skip the normal cycle) so Neil can
         # finish the booking via /control before the loop re-walks 4010 and
         # navigates away. Detect-only, so the human still does the captcha + SMS.
-        import bcncita.cita as _cita_mod
         if getattr(_cita_mod, "LAST_4047_OFFER", False):
             _cita_mod.LAST_4047_OFFER = False
             hold_s = int(os.environ.get("PROBE_4047_HOLD_S", "1800"))
             _stats["last_state"] = "4047 offer — holding for /control booking"
             log.info(f"4047 OFFER — holding {hold_s}s; browser parked on the offer for /control booking")
             time.sleep(hold_s)
+            continue
+
+        # Possible 4010 offer not booked: park the browser on it. Plain sleep, no
+        # driver calls (one would dismiss an open ICP+ confirm dialog under a human
+        # booking on noVNC). A pause set during the park keeps it parked after.
+        if _cita_mod.LAST_4010_OFFER:
+            _stats["last_state"] = "possible 4010 offer — browser parked"
+            log.info(f"4010 possible offer — parking browser {_cita_mod.ACCITAR_OFFER_HOLD_S:.0f}s")
+            time.sleep(_cita_mod.ACCITAR_OFFER_HOLD_S)
+            _cita_mod.release_offer_park()
             continue
 
         # Watchdog: push if no cycle has reached the cita page for STALE_ALERT_S.
