@@ -1504,7 +1504,9 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
     the form and submit via envia() — instead of GET-ing the acInfo deep-link,
     which omits the office and the per-session form token and makes the server
     return 'no hay citas'. The site re-renders the selection page (selectSede)
-    once with the trámite reset, so re-select and re-submit (loop)."""
+    once with the trámite reset, so re-select and re-submit (loop).
+    Returns True (advanced), False (did not advance) or PORTADA_NO_JS (envia()
+    never loaded — the caller backs off)."""
     # Select office (sede) + trámite and submit via envia() — the JS submit the
     # page's own Aceptar button calls. This version advanced cleanly past the
     # selection page; real-click attempts got intercepted by the header overlay.
@@ -1523,7 +1525,7 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
             Select(tramite[0]).select_by_value(op_val)
         except Exception as e:
             logging.error(f"sede/trámite selection failed: {e}")
-            return
+            return False
         time.sleep(random.uniform(0.8, 1.8))
         # envia() lives in icp-*.min.js, which loads after the F5 TSPD scripts.
         # Calling it early raised "envia is not defined"; the old fallback then
@@ -1606,13 +1608,17 @@ def initial_page(
     qs = urllib.parse.parse_qs(urllib.parse.urlparse(fast_forward_url2).query)
     op_param = next(iter(qs.keys()), "tramiteGrupo[1]")
     op_val = qs.get(op_param, [context.operation_code.value])[0]
+    # Returned, not raised, so the backoff decorator does not reload the portada.
     if _select_and_submit_tramite(driver, context, op_param, op_val) == PORTADA_NO_JS:
-        context._portada_no_js = True  # cycle_cita backs off (no backoff-decorator retry)
-        return
+        return PORTADA_NO_JS
     time.sleep(random.uniform(1.5, 4))
 
     # PAI: detect page state after second navigation
     page_state = detect_page_state(driver)
+
+    if page_state == PageState.SESSION_EXPIRED:
+        context.first_load = True  # keep _rate_limit_count: a 429 usually caused it
+        return PageState.SESSION_EXPIRED
 
     if page_state == PageState.RATE_LIMITED:
         _rate_limit_count = getattr(context, '_rate_limit_count', 0) + 1
@@ -1672,7 +1678,8 @@ def _real_click(driver: webdriver, el) -> None:
         driver.execute_script("arguments[0].click();", el)
 
 
-def _handle_rate_limit(driver: webdriver, context: CustomerProfile, resp_text: str, where: str):
+def _handle_rate_limit(driver: webdriver, context: CustomerProfile, resp_text: str, where: str,
+                       reason: str = "429 Too Many Requests"):
     """Self-heal for the two distinct block pages detect_page_state lumps into
     RATE_LIMITED. Returns None always (caller should return it to retry next cycle).
       - F5 ("Request Rejected" / "support id"): block is cookie-pinned on the icp
@@ -1690,7 +1697,7 @@ def _handle_rate_limit(driver: webdriver, context: CustomerProfile, resp_text: s
     _rate_limit_count = getattr(context, "_rate_limit_count", 0) + 1
     context._rate_limit_count = _rate_limit_count
     wait_sec = int(min(120 * (2 ** (_rate_limit_count - 1)), 600) + random.uniform(0, 60))
-    logging.warning(f"429 Too Many Requests ({where}) — hit #{_rate_limit_count}, sleeping {wait_sec}s")
+    logging.warning(f"{reason} ({where}) — hit #{_rate_limit_count}, sleeping {wait_sec}s")
     _capture_diagnostics(driver, f"rate-limited-{where}", context.save_artifacts)
     time.sleep(wait_sec)
     context.first_load = True
@@ -1711,11 +1718,14 @@ def cycle_cita(
     """
     # initial_page navigates the portada (sede=99 + tramiteGrupo[0]=4010, envia())
     # and lands on acInfo (PageState.INSTRUCTIONS — has btnEntrar + btnAccesoClave).
-    context._portada_no_js = False
-    initial_page(driver, context, fast_forward_url, fast_forward_url2)
-    if context._portada_no_js:
-        # Treated like a throttle: F5 page → clear icp cookies; else 429 backoff.
-        return _handle_rate_limit(driver, context, body_text(driver), "portada-nojs")
+    start = initial_page(driver, context, fast_forward_url, fast_forward_url2)
+    if start == PORTADA_NO_JS:
+        # Treated like a throttle: F5 page → clear icp cookies; else backoff.
+        return _handle_rate_limit(driver, context, body_text(driver), "portada-nojs",
+                                  reason="portada scripts withheld")
+    if start == PageState.SESSION_EXPIRED:
+        logging.warning("ICP session expired at the portada — retry next cycle")
+        return None
 
     # ── Step 3: acInfo — click "Presentación con Cl@ve" (NOT btnEntrar/sin-Cl@ve) ──
     clave_btn = find_element_resilient(driver, BTN_ACCESO_CLAVE, timeout=DELAY)

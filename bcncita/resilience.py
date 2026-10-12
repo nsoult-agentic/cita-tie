@@ -279,12 +279,12 @@ _STATE_SIGNALS = {
 _PRIORITY_ORDER = [
     PageState.RATE_LIMITED,
     PageState.ERROR,
-    PageState.SESSION_EXPIRED,
     PageState.SUCCESS,
     PageState.SMS_CODE_WRONG,
     PageState.CONFIRMATION,
     PageState.SLOT_SELECTION_5MIN,
     PageState.SLOT_SELECTION_TABLE,
+    PageState.SESSION_EXPIRED,  # after the offer states: it must never hide an offer
     PageState.NO_APPOINTMENTS,
     PageState.CONTACT_INFO,
     PageState.OFFICE_SELECTION,
