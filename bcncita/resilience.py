@@ -5,6 +5,7 @@ screenshot capture, and ntfy notifications.
 """
 import functools
 import logging
+import os
 import random
 import time
 from datetime import datetime as dt
@@ -97,14 +98,10 @@ def find_elements_resilient(
 def _page_context(driver: WebDriver) -> str:
     """URL, title and the start of the body text, for a log line."""
     try:
-        url = driver.current_url
-        title = driver.title
-        body = ""
-        try:
-            body = driver.find_element("tag name", "body").text[:300].replace("\n", " | ")
-        except Exception:
-            pass
-        return f"url={url} title={title!r} body={body!r}"
+        # No body text and no query string: pages show the NIE/name, and Cl@ve
+        # URLs can carry login parameters. The saved .html has the full page.
+        url = (driver.current_url or "").split("?", 1)[0]
+        return f"url={url} title={driver.title!r}"
     except Exception as e:
         return f"(page context unavailable: {e})"
 
@@ -113,27 +110,31 @@ def _capture_fallback(driver: WebDriver, name: str) -> Optional[str]:
     """Save screenshot + rendered HTML of the page a fallback matched on."""
     ts = dt.now().strftime("%Y%m%d-%H%M%S")
     base = f"{FALLBACK_DIAG_DIR}/fallback-{name}-{ts}"
+    saved = None
     try:
-        driver.save_screenshot(f"{base}.png")
+        if driver.save_screenshot(f"{base}.png"):
+            saved = f"{base}.png"
+    except Exception as e:
+        log.warning(f"FALLBACK screenshot failed for '{name}': {e}")
+    try:
         with open(f"{base}.html", "w", encoding="utf-8") as f:
             f.write(driver.page_source or "")
-        return f"{base}.png"
+        saved = saved or f"{base}.html"
     except Exception as e:
-        log.warning(f"FALLBACK capture failed for '{name}': {e}")
-        return None
+        log.warning(f"FALLBACK HTML save failed for '{name}': {e}")
+    return saved
 
 
 def _record_fallback(name: str, by: str, value: str, driver: Optional[WebDriver] = None):
     count = _fallback_hits.get(name, (None, None, 0))[2]
     _fallback_hits[name] = (by, value, count + 1)
     log.warning(f"FALLBACK: '{name}' found via ({by}, '{value}') — update selectors.py")
-    if driver is None:
+    if driver is None or name in _fallback_captures:
         return
     log.warning(f"FALLBACK: '{name}' page: {_page_context(driver)}")
-    if name not in _fallback_captures:
-        _fallback_captures[name] = _capture_fallback(driver, name)
-        if _fallback_captures[name]:
-            log.warning(f"FALLBACK: '{name}' screenshot: {_fallback_captures[name]} (+ .html)")
+    _fallback_captures[name] = _capture_fallback(driver, name)
+    if _fallback_captures[name]:
+        log.warning(f"FALLBACK: '{name}' saved: {_fallback_captures[name]}")
 
 
 def get_fallback_report() -> str:
@@ -143,7 +144,7 @@ def get_fallback_report() -> str:
     for n, (by, v, c) in _fallback_hits.items():
         line = f"  {n}: {by}='{v}' ({c}x)"
         if _fallback_captures.get(n):
-            line += f" — {_fallback_captures[n].rsplit('/', 1)[-1]}"
+            line += f" — {os.path.basename(_fallback_captures[n])}"
         lines.append(line)
     return "Fallback selectors used:\n" + "\n".join(lines)
 

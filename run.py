@@ -404,11 +404,12 @@ def _ntfy(title, message, ntfy_config_raw, priority="default", tags=""):
 
 def cleanup_old_screenshots(data_dir="/app/data", max_age_days=7):
     """Delete screenshots older than max_age_days to prevent PII accumulation.
-    Top-level *.png (and fallback-*.html) only: the no-citas evidence record
-    under /app/data/evidence/ is kept on purpose and must not be globbed here."""
+    Top-level *.png and *.html only (saved pages can hold the NIE/name): the
+    no-citas evidence record under /app/data/evidence/ is kept on purpose and
+    must not be globbed here (glob is non-recursive)."""
     cutoff = time.time() - (max_age_days * 86400)
     data = pathlib.Path(data_dir)
-    for f in [*data.glob("*.png"), *data.glob("fallback-*.html")]:
+    for f in [*data.glob("*.png"), *data.glob("*.html")]:
         try:
             if f.stat().st_mtime < cutoff:
                 f.unlink()
@@ -502,7 +503,6 @@ def main():
     _start_health_server(port=int(os.environ.get("SMS_CODE_PORT", "8080")))
 
     profile, ntfy_config = build_profile()
-    cleanup_old_screenshots()
 
     _ntfy(
         "TIE Checker Started",
@@ -515,6 +515,14 @@ def main():
     last_heartbeat = time.time()
 
     while True:
+        # /control/probe?cmd=pause also pauses the 4010 loop, so a human booking
+        # on the shared browser is never navigated away mid-booking.
+        if _ctl.get("probe_pause"):
+            _stats["last_state"] = "paused via /control/probe"
+            time.sleep(20)
+            continue
+        cleanup_old_screenshots()  # every run: the process can stay up for weeks
+
         hot = is_hot_window()
         cycles = HOT_CYCLES if hot else COLD_CYCLES
         sleep_time = HOT_SLEEP if hot else COLD_SLEEP
@@ -554,6 +562,13 @@ def main():
             _stats["last_state"] = "4047 offer — holding for /control booking"
             log.info(f"4047 OFFER — holding {hold_s}s; browser parked on the offer for /control booking")
             time.sleep(hold_s)
+            continue
+
+        # Possible 4010 offer (unrecognised acCitar page): park the browser on it
+        # until the human is done (park_on_offer extends while the page changes).
+        if getattr(_cita_mod, "LAST_4010_OFFER", False):
+            _stats["last_state"] = "possible 4010 offer — browser parked"
+            _cita_mod.park_on_offer()
             continue
 
         # Watchdog: push if no cycle has reached the cita page for STALE_ALERT_S.
