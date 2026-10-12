@@ -43,7 +43,7 @@ _stats = {
 
 
 # ── Remote orchestration state (manual control of one Selenium driver) ──
-_ctl = {"driver": None, "profile": None, "last_control": 0.0, "probe_pause": False}
+_ctl = {"driver": None, "profile": None, "last_control": 0.0}
 
 # Serializes access to the single driver between the /control API (human-driven
 # booking) and the unattended PROBE_4047 loop, so they never navigate mid-walk.
@@ -130,12 +130,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
             sub = q.get("cmd", ["status"])[0]
             from bcncita.cita import PAUSE
             if sub == "pause":
-                _ctl["probe_pause"] = True
                 PAUSE.set()
             elif sub == "resume":
-                _ctl["probe_pause"] = False
                 PAUSE.clear()
-            return self._cjson({"ok": True, "probe_pause": _ctl["probe_pause"]})
+            return self._cjson({"ok": True, "probe_pause": PAUSE.is_set()})
         _ctl["last_control"] = time.time()
         if not _ctl_lock.acquire(timeout=120):
             return self._cjson({"error": "driver busy (probe walk in progress)"}, 503)
@@ -460,7 +458,7 @@ def main():
         # offer for step-by-step /control finishing (captcha + SMS).
         probe_4047 = os.environ.get("PROBE_4047", "").lower() == "true" and _ctl.get("profile") is not None
         if probe_4047:
-            from bcncita.cita import probe_4047_sinclave
+            from bcncita.cita import probe_4047_sinclave, PAUSE
             from bcncita.cita import _ntfy as _cita_ntfy
             log.info("PROBE_4047: unattended sin-Cl@ve polling of the 4047 queue ENABLED")
         while True:
@@ -474,7 +472,7 @@ def main():
             # can't prevent the probe from clobbering a live booking. The idle
             # guard is only a secondary backstop against grabbing the driver
             # while a human is actively clicking.
-            if _ctl.get("probe_pause") or (time.time() - _ctl.get("last_control", 0.0) < CONTROL_IDLE_GUARD):
+            if PAUSE.is_set() or (time.time() - _ctl.get("last_control", 0.0) < CONTROL_IDLE_GUARD):
                 time.sleep(20)
                 continue
             outcome = "ERROR"

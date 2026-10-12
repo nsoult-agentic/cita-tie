@@ -28,9 +28,8 @@ _fallback_hits: dict = {}
 # selector per cycle, so a repeating fallback does not fill the disk)
 _fallback_captures: dict = {}
 
-# Top-level /app/data so cleanup_old_screenshots() in run.py ages them out
-# (the HTML can hold autofilled personal data).
-FALLBACK_DIAG_DIR = "/app/data"
+# Saved pages go to the top level of DATA_DIR (see save_page).
+DATA_DIR = "/app/data"
 
 
 def find_element_resilient(
@@ -100,10 +99,11 @@ def url_no_query(url: str) -> str:
     return (url or "").split("?", 1)[0]
 
 
-def save_page(driver: WebDriver, base: str) -> Optional[str]:
-    """Save <base>.png and <base>.html independently. Keep base at the top level
-    of /app/data so cleanup_old_screenshots (run.py) ages the files out: the
-    pages can show the NIE/name. Returns the first file saved, or None."""
+def save_page(driver: WebDriver, prefix: str) -> Optional[str]:
+    """Save DATA_DIR/<prefix>-<ts>.png and .html independently. Top level of
+    DATA_DIR so cleanup_old_screenshots (run.py) ages the files out: the pages
+    can show the NIE/name. Returns the first file saved, or None."""
+    base = f"{DATA_DIR}/{prefix}-{dt.now().strftime('%Y%m%d-%H%M%S')}"
     saved = None
     try:
         if driver.save_screenshot(f"{base}.png"):
@@ -122,7 +122,7 @@ def save_page(driver: WebDriver, base: str) -> Optional[str]:
 
 
 def _page_context(driver: WebDriver) -> str:
-    """URL, title and the start of the body text, for a log line."""
+    """URL (no query) and title, for a log line."""
     try:
         # No body text and no query string: pages show the NIE/name, and Cl@ve
         # URLs can carry login parameters. The saved .html has the full page.
@@ -133,8 +133,7 @@ def _page_context(driver: WebDriver) -> str:
 
 def _capture_fallback(driver: WebDriver, name: str) -> Optional[str]:
     """Save screenshot + rendered HTML of the page a fallback matched on."""
-    ts = dt.now().strftime("%Y%m%d-%H%M%S")
-    return save_page(driver, f"{FALLBACK_DIAG_DIR}/fallback-{name}-{ts}")
+    return save_page(driver, f"fallback-{name}")
 
 
 def _record_fallback(name: str, by: str, value: str, driver: Optional[WebDriver] = None):
