@@ -78,7 +78,8 @@ ACCITAR_OFFER_HOLD_S = float(os.environ.get("ACCITAR_OFFER_HOLD_S", "1800"))
 # At most one push of each kind (urgent possible offer, unexpected page) per this many seconds.
 ALERT_DEDUPE_S = float(os.environ.get("ALERT_DEDUPE_S", "600"))
 _OFFER_STATES = (PageState.SLOT_SELECTION_TABLE, PageState.SLOT_SELECTION_5MIN)
-_ACCITAR_KNOWN_STATES = (PageState.RATE_LIMITED, PageState.NO_APPOINTMENTS, *_OFFER_STATES)
+_ACCITAR_KNOWN_STATES = (PageState.RATE_LIMITED, PageState.SESSION_EXPIRED,
+                         PageState.NO_APPOINTMENTS, *_OFFER_STATES)
 # Element ids that only appear when citas are offered (office list, slot table).
 _OFFER_ELEMENT_IDS = ("idSede", "CitaMAP_HORAS")
 _last_alert: Dict[str, float] = {}
@@ -1494,12 +1495,18 @@ def log_backoff(details):
     )
 
 
+# _select_and_submit_tramite result when envia() never loaded on the portada.
+PORTADA_NO_JS = "NO_JS"
+
+
 def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_param, op_val):
     """Replicate the REAL human portada flow: pick the office (sede) + trámite on
     the form and submit via envia() — instead of GET-ing the acInfo deep-link,
     which omits the office and the per-session form token and makes the server
     return 'no hay citas'. The site re-renders the selection page (selectSede)
-    once with the trámite reset, so re-select and re-submit (loop)."""
+    once with the trámite reset, so re-select and re-submit (loop).
+    Returns True (advanced), False (did not advance) or PORTADA_NO_JS (envia()
+    never loaded — the caller backs off)."""
     # Select office (sede) + trámite and submit via envia() — the JS submit the
     # page's own Aceptar button calls. This version advanced cleanly past the
     # selection page; real-click attempts got intercepted by the header overlay.
@@ -1507,7 +1514,7 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
         tramite = driver.find_elements(By.NAME, op_param)
         if not tramite:
             logging.info(f"Trámite+office submitted (attempt {attempt}); advanced")
-            return
+            return True
         try:
             sede = driver.find_elements(By.NAME, "sede")
             if sede:
@@ -1518,16 +1525,23 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
             Select(tramite[0]).select_by_value(op_val)
         except Exception as e:
             logging.error(f"sede/trámite selection failed: {e}")
-            return
+            return False
         time.sleep(random.uniform(0.8, 1.8))
         # envia() lives in icp-*.min.js, which loads after the F5 TSPD scripts.
         # Calling it early raised "envia is not defined"; the old fallback then
         # clicked the portada's own Aceptar button (#btnAceptar, onclick=envia()),
         # which fails the same way (fallback-btn_entrar capture, 2026-10-12).
+        # If it never loads, the page scripts are being withheld (seen right
+        # before a 429, 2026-10-12 14:05): stop and let the caller back off
+        # instead of hitting the portada again.
         try:
             WebDriverWait(driver, 15).until(
                 lambda d: d.execute_script("return typeof envia === 'function'")
             )
+        except TimeoutException:
+            logging.warning("portada: envia() not loaded after 15 s — page scripts withheld, backing off")
+            return PORTADA_NO_JS
+        try:
             driver.execute_script("envia();")
         except Exception as e:
             logging.warning(f"portada: envia() not available/failed (attempt {attempt + 1}): "
@@ -1544,8 +1558,9 @@ def _select_and_submit_tramite(driver: webdriver, context: CustomerProfile, op_p
             pass
         if not driver.find_elements(By.NAME, op_param):
             logging.info(f"Trámite+office submitted (attempt {attempt + 1}); advanced")
-            return
+            return True
     logging.warning("Still on selection page after 4 submit attempts")
+    return False
 
 
 @backoff.on_exception(
@@ -1593,11 +1608,17 @@ def initial_page(
     qs = urllib.parse.parse_qs(urllib.parse.urlparse(fast_forward_url2).query)
     op_param = next(iter(qs.keys()), "tramiteGrupo[1]")
     op_val = qs.get(op_param, [context.operation_code.value])[0]
-    _select_and_submit_tramite(driver, context, op_param, op_val)
+    # Returned, not raised, so the backoff decorator does not reload the portada.
+    if _select_and_submit_tramite(driver, context, op_param, op_val) == PORTADA_NO_JS:
+        return PORTADA_NO_JS
     time.sleep(random.uniform(1.5, 4))
 
     # PAI: detect page state after second navigation
     page_state = detect_page_state(driver)
+
+    if page_state == PageState.SESSION_EXPIRED:
+        context.first_load = True  # keep _rate_limit_count: a 429 usually caused it
+        return PageState.SESSION_EXPIRED
 
     if page_state == PageState.RATE_LIMITED:
         _rate_limit_count = getattr(context, '_rate_limit_count', 0) + 1
@@ -1657,7 +1678,8 @@ def _real_click(driver: webdriver, el) -> None:
         driver.execute_script("arguments[0].click();", el)
 
 
-def _handle_rate_limit(driver: webdriver, context: CustomerProfile, resp_text: str, where: str):
+def _handle_rate_limit(driver: webdriver, context: CustomerProfile, resp_text: str, where: str,
+                       reason: str = "429 Too Many Requests"):
     """Self-heal for the two distinct block pages detect_page_state lumps into
     RATE_LIMITED. Returns None always (caller should return it to retry next cycle).
       - F5 ("Request Rejected" / "support id"): block is cookie-pinned on the icp
@@ -1675,7 +1697,7 @@ def _handle_rate_limit(driver: webdriver, context: CustomerProfile, resp_text: s
     _rate_limit_count = getattr(context, "_rate_limit_count", 0) + 1
     context._rate_limit_count = _rate_limit_count
     wait_sec = int(min(120 * (2 ** (_rate_limit_count - 1)), 600) + random.uniform(0, 60))
-    logging.warning(f"429 Too Many Requests ({where}) — hit #{_rate_limit_count}, sleeping {wait_sec}s")
+    logging.warning(f"{reason} ({where}) — hit #{_rate_limit_count}, sleeping {wait_sec}s")
     _capture_diagnostics(driver, f"rate-limited-{where}", context.save_artifacts)
     time.sleep(wait_sec)
     context.first_load = True
@@ -1696,7 +1718,14 @@ def cycle_cita(
     """
     # initial_page navigates the portada (sede=99 + tramiteGrupo[0]=4010, envia())
     # and lands on acInfo (PageState.INSTRUCTIONS — has btnEntrar + btnAccesoClave).
-    initial_page(driver, context, fast_forward_url, fast_forward_url2)
+    start = initial_page(driver, context, fast_forward_url, fast_forward_url2)
+    if start == PORTADA_NO_JS:
+        # Treated like a throttle: F5 page → clear icp cookies; else backoff.
+        return _handle_rate_limit(driver, context, body_text(driver), "portada-nojs",
+                                  reason="portada scripts withheld")
+    if start == PageState.SESSION_EXPIRED:
+        logging.warning("ICP session expired at the portada — retry next cycle")
+        return None
 
     # ── Step 3: acInfo — click "Presentación con Cl@ve" (NOT btnEntrar/sin-Cl@ve) ──
     clave_btn = find_element_resilient(driver, BTN_ACCESO_CLAVE, timeout=DELAY)
@@ -1901,12 +1930,19 @@ def cycle_cita(
         page_state = detect_page_state(driver, resp_text)
         if page_state == PageState.NO_APPOINTMENTS and not _is_accitar_no_citas(driver):
             page_state = PageState.UNKNOWN
+        # Text is matched before elements, so a visible office list / slot table
+        # with "sesión ha caducado" text must still go to the possible-offer path.
+        if page_state == PageState.SESSION_EXPIRED and _offer_elements_visible(driver):
+            page_state = PageState.UNKNOWN
         if page_state in _ACCITAR_KNOWN_STATES or time.time() >= deadline:
             break
         time.sleep(1)
 
     if page_state == PageState.RATE_LIMITED:
         return _handle_rate_limit(driver, context, resp_text, "accitar")
+    if page_state == PageState.SESSION_EXPIRED:
+        logging.warning("[con-Cl@ve 5] ICP session expired (infogenerica) — retry next cycle")
+        return None
     if page_state == PageState.NO_APPOINTMENTS:
         logging.info("[con-Cl@ve 5] acCitar — no hay citas disponibles this cycle")
         _capture_no_citas_evidence(driver, "4010-clave")
@@ -1943,18 +1979,27 @@ def cycle_cita(
     return None
 
 
+def _offer_elements_visible(driver: webdriver) -> bool:
+    """True if an office list / slot table is visible. Visible only: a hidden
+    form field with the same id must not turn every clean check into a park
+    (the acCitar markup is unverified). True on error, so callers fail toward
+    treating the page as a possible offer."""
+    try:
+        return any(e.is_displayed() for i in _OFFER_ELEMENT_IDS
+                   for e in driver.find_elements(By.ID, i))
+    except Exception as e:
+        logging.warning(f"[con-Cl@ve 5] offer-element check failed: {str(e).splitlines()[0] if str(e) else e!r}")
+        return True
+
+
 def _is_accitar_no_citas(driver: webdriver) -> bool:
     """True only on the real acCitar page with no office list / slot table."""
     try:
         if "acCitar" not in (driver.current_url or ""):
             return False
-        # Visible only: a hidden form field with the same id must not turn every
-        # clean check into a park (the acCitar markup is unverified).
-        return not any(e.is_displayed() for i in _OFFER_ELEMENT_IDS
-                       for e in driver.find_elements(By.ID, i))
-    except Exception as e:
-        logging.warning(f"[con-Cl@ve 5] no-citas check failed: {str(e).splitlines()[0] if str(e) else e!r}")
+    except Exception:
         return False
+    return not _offer_elements_visible(driver)
 
 
 def _mark_offer_parked(driver: webdriver):
@@ -2360,7 +2405,11 @@ def probe_4047_sinclave(driver: webdriver, context: CustomerProfile) -> str:
         time.sleep(2)
         # Office + trámite via the proven retry loop (the site re-renders the
         # selection page once with the trámite reset).
-        _select_and_submit_tramite(driver, context, "tramiteGrupo[0]", "4047")
+        # The portada's own banner says "no hay citas", so a failed submit must
+        # not fall through to the EMPTY check below.
+        if _select_and_submit_tramite(driver, context, "tramiteGrupo[0]", "4047") is not True:
+            logging.warning("[4047 probe] portada submit did not advance")
+            return "ERROR"
         time.sleep(1)
         # acInfo — "Entrar" (sin-Cl@ve; 4047 offers no con-Cl@ve button).
         entrar = driver.find_elements(By.ID, "btnEntrar")

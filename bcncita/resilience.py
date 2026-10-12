@@ -182,6 +182,7 @@ class PageState(Enum):
     SUCCESS = auto()
     SMS_CODE_WRONG = auto()
     VALIDATION_PAGE = auto()
+    SESSION_EXPIRED = auto()
     UNKNOWN = auto()
 
 
@@ -196,6 +197,14 @@ _STATE_SIGNALS = {
     PageState.ERROR: {
         "text": [("Se ha producido un error en el sistema", False),
                  ("error en el sistema", False)],
+        "title": [],
+        "elements": [],
+    },
+    # ICP+ /infogenerica "Su sesión ha caducado por permanecer demasiado tiempo
+    # inactiva" (seen after a 429, 2026-10-12). Server-side ICP session only;
+    # the next cycle restarts from the portada.
+    PageState.SESSION_EXPIRED: {
+        "text": [("sesión ha caducado", False)],
         "title": [],
         "elements": [],
     },
@@ -275,6 +284,7 @@ _PRIORITY_ORDER = [
     PageState.CONFIRMATION,
     PageState.SLOT_SELECTION_5MIN,
     PageState.SLOT_SELECTION_TABLE,
+    PageState.SESSION_EXPIRED,  # after the offer states: it must never hide an offer
     PageState.NO_APPOINTMENTS,
     PageState.CONTACT_INFO,
     PageState.OFFICE_SELECTION,
