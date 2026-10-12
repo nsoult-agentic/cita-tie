@@ -1930,6 +1930,10 @@ def cycle_cita(
         page_state = detect_page_state(driver, resp_text)
         if page_state == PageState.NO_APPOINTMENTS and not _is_accitar_no_citas(driver):
             page_state = PageState.UNKNOWN
+        # Text is matched before elements, so a visible office list / slot table
+        # with "sesión ha caducado" text must still go to the possible-offer path.
+        if page_state == PageState.SESSION_EXPIRED and _offer_elements_visible(driver):
+            page_state = PageState.UNKNOWN
         if page_state in _ACCITAR_KNOWN_STATES or time.time() >= deadline:
             break
         time.sleep(1)
@@ -1975,18 +1979,27 @@ def cycle_cita(
     return None
 
 
+def _offer_elements_visible(driver: webdriver) -> bool:
+    """True if an office list / slot table is visible. Visible only: a hidden
+    form field with the same id must not turn every clean check into a park
+    (the acCitar markup is unverified). True on error, so callers fail toward
+    treating the page as a possible offer."""
+    try:
+        return any(e.is_displayed() for i in _OFFER_ELEMENT_IDS
+                   for e in driver.find_elements(By.ID, i))
+    except Exception as e:
+        logging.warning(f"[con-Cl@ve 5] offer-element check failed: {str(e).splitlines()[0] if str(e) else e!r}")
+        return True
+
+
 def _is_accitar_no_citas(driver: webdriver) -> bool:
     """True only on the real acCitar page with no office list / slot table."""
     try:
         if "acCitar" not in (driver.current_url or ""):
             return False
-        # Visible only: a hidden form field with the same id must not turn every
-        # clean check into a park (the acCitar markup is unverified).
-        return not any(e.is_displayed() for i in _OFFER_ELEMENT_IDS
-                       for e in driver.find_elements(By.ID, i))
-    except Exception as e:
-        logging.warning(f"[con-Cl@ve 5] no-citas check failed: {str(e).splitlines()[0] if str(e) else e!r}")
+    except Exception:
         return False
+    return not _offer_elements_visible(driver)
 
 
 def _mark_offer_parked(driver: webdriver):
