@@ -128,10 +128,13 @@ class _HealthHandler(BaseHTTPRequestHandler):
         # status poll would keep resetting the idle guard and starve the probe.
         if cmd == "probe":
             sub = q.get("cmd", ["status"])[0]
+            from bcncita.cita import PAUSE
             if sub == "pause":
                 _ctl["probe_pause"] = True
+                PAUSE.set()
             elif sub == "resume":
                 _ctl["probe_pause"] = False
+                PAUSE.clear()
             return self._cjson({"ok": True, "probe_pause": _ctl["probe_pause"]})
         _ctl["last_control"] = time.time()
         if not _ctl_lock.acquire(timeout=120):
@@ -515,10 +518,17 @@ def main():
     last_heartbeat = time.time()
 
     while True:
-        # /control/probe?cmd=pause also pauses the 4010 loop, so a human booking
-        # on the shared browser is never navigated away mid-booking.
-        if _ctl.get("probe_pause"):
+        # /control/probe?cmd=pause also pauses the 4010 loop (and stops a run's
+        # cycles, see PAUSE in bcncita.cita), so a human booking on the shared
+        # browser is not navigated away. The stale watchdog keeps running, so a
+        # forgotten pause still raises "No cita checks working".
+        import bcncita.cita as _cita_mod
+        if _cita_mod.PAUSE.is_set():
             _stats["last_state"] = "paused via /control/probe"
+            try:
+                _cita_mod.check_stale_and_alert()
+            except Exception as e:
+                log.error(f"stale-check failed: {e}")
             time.sleep(20)
             continue
         cleanup_old_screenshots()  # every run: the process can stay up for weeks
@@ -555,7 +565,6 @@ def main():
         # offer, keep the browser parked on it (skip the normal cycle) so Neil can
         # finish the booking via /control before the loop re-walks 4010 and
         # navigates away. Detect-only, so the human still does the captcha + SMS.
-        import bcncita.cita as _cita_mod
         if getattr(_cita_mod, "LAST_4047_OFFER", False):
             _cita_mod.LAST_4047_OFFER = False
             hold_s = int(os.environ.get("PROBE_4047_HOLD_S", "1800"))
@@ -564,11 +573,14 @@ def main():
             time.sleep(hold_s)
             continue
 
-        # Possible 4010 offer (unrecognised acCitar page): park the browser on it
-        # until the human is done (park_on_offer extends while the page changes).
-        if getattr(_cita_mod, "LAST_4010_OFFER", False):
+        # Possible 4010 offer not booked: park the browser on it. Plain sleep, no
+        # driver calls (one would dismiss an open ICP+ confirm dialog under a human
+        # booking on noVNC). A pause set during the park keeps it parked after.
+        if _cita_mod.LAST_4010_OFFER:
             _stats["last_state"] = "possible 4010 offer — browser parked"
-            _cita_mod.park_on_offer()
+            log.info(f"4010 possible offer — parking browser {_cita_mod.ACCITAR_OFFER_HOLD_S:.0f}s")
+            time.sleep(_cita_mod.ACCITAR_OFFER_HOLD_S)
+            _cita_mod.release_offer_park()
             continue
 
         # Watchdog: push if no cycle has reached the cita page for STALE_ALERT_S.

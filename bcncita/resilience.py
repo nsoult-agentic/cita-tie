@@ -95,13 +95,38 @@ def find_elements_resilient(
     return result if result else []
 
 
+def url_no_query(url: str) -> str:
+    """URL without its query string (Cl@ve URLs can carry login parameters)."""
+    return (url or "").split("?", 1)[0]
+
+
+def save_page(driver: WebDriver, base: str) -> Optional[str]:
+    """Save <base>.png and <base>.html independently. Keep base at the top level
+    of /app/data so cleanup_old_screenshots (run.py) ages the files out: the
+    pages can show the NIE/name. Returns the first file saved, or None."""
+    saved = None
+    try:
+        if driver.save_screenshot(f"{base}.png"):
+            saved = f"{base}.png"
+        else:
+            log.warning(f"screenshot not saved: {base}.png")
+    except Exception as e:
+        log.warning(f"screenshot failed for {base}: {e}")
+    try:
+        with open(f"{base}.html", "w", encoding="utf-8") as f:
+            f.write(driver.page_source or "")
+        saved = saved or f"{base}.html"
+    except Exception as e:
+        log.warning(f"page HTML save failed for {base}: {e}")
+    return saved
+
+
 def _page_context(driver: WebDriver) -> str:
     """URL, title and the start of the body text, for a log line."""
     try:
         # No body text and no query string: pages show the NIE/name, and Cl@ve
         # URLs can carry login parameters. The saved .html has the full page.
-        url = (driver.current_url or "").split("?", 1)[0]
-        return f"url={url} title={driver.title!r}"
+        return f"url={url_no_query(driver.current_url)} title={driver.title!r}"
     except Exception as e:
         return f"(page context unavailable: {e})"
 
@@ -109,20 +134,7 @@ def _page_context(driver: WebDriver) -> str:
 def _capture_fallback(driver: WebDriver, name: str) -> Optional[str]:
     """Save screenshot + rendered HTML of the page a fallback matched on."""
     ts = dt.now().strftime("%Y%m%d-%H%M%S")
-    base = f"{FALLBACK_DIAG_DIR}/fallback-{name}-{ts}"
-    saved = None
-    try:
-        if driver.save_screenshot(f"{base}.png"):
-            saved = f"{base}.png"
-    except Exception as e:
-        log.warning(f"FALLBACK screenshot failed for '{name}': {e}")
-    try:
-        with open(f"{base}.html", "w", encoding="utf-8") as f:
-            f.write(driver.page_source or "")
-        saved = saved or f"{base}.html"
-    except Exception as e:
-        log.warning(f"FALLBACK HTML save failed for '{name}': {e}")
-    return saved
+    return save_page(driver, f"{FALLBACK_DIAG_DIR}/fallback-{name}-{ts}")
 
 
 def _record_fallback(name: str, by: str, value: str, driver: Optional[WebDriver] = None):
