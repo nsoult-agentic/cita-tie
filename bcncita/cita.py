@@ -43,6 +43,7 @@ from .resilience import (
     submit_form_resilient,
     clear_icp_cookies,
     reset_icp_session,
+    _record_fallback,
     PageState,
     StepError,
     get_fallback_report,
@@ -352,6 +353,14 @@ def _ntfy(title, message, priority="default", tags=""):
 # enough for a scan, and alert (first time immediately, then every
 # CLAVE_ALERT_REPEAT_S until the login is back).
 CLAVE_QR_WAIT_S = int(os.environ.get("CLAVE_QR_WAIT_S", "240"))
+# The QR page also comes once an hour while the login is still good, at the
+# anniversary minute of the last real scan (clave-events.jsonl 10-09..10-13: no
+# scan after 10-09 20:36, QR every ~60 min, next attempt passes 16/19 times).
+# If a cycle reached acCitar within CLAVE_QR_RECENT_GOOD_S, a first QR is that
+# hourly prompt: hold only CLAVE_QR_SHORT_WAIT_S. A QR on the next attempt
+# still gets the full CLAVE_QR_WAIT_S hold and the alert.
+CLAVE_QR_SHORT_WAIT_S = int(os.environ.get("CLAVE_QR_SHORT_WAIT_S", "15"))
+CLAVE_QR_RECENT_GOOD_S = int(os.environ.get("CLAVE_QR_RECENT_GOOD_S", "4200"))
 CLAVE_ALERT_REPEAT_S = int(os.environ.get("CLAVE_ALERT_REPEAT_S", "3600"))
 STALE_ALERT_S = int(os.environ.get("STALE_ALERT_S", "7200"))
 NOVNC_URL = os.environ.get("NOVNC_URL", "http://172.16.10.25:7900")
@@ -364,6 +373,9 @@ ALERT_QUIET_END = int(os.environ.get("ALERT_QUIET_END", "11"))
 CLAVE_EVENTS_FILE = os.environ.get("CLAVE_EVENTS_FILE", "/app/data/clave-events.jsonl")
 
 _last_good_check = time.time()  # container start counts as the baseline
+# Last REAL good check (no container-start baseline): a redeploy after an outage
+# must not make the first QR look like the hourly prompt.
+_last_real_good_check = 0.0
 _clave_alert_at = 0.0  # 0 = no outstanding login-lost alert
 _stale_alert_at = 0.0
 _last_qr_left = 0.0  # when the bot last left the QR page (= a scan or silent re-auth)
@@ -423,6 +435,34 @@ def _on_clave_qr_page(driver) -> bool:
     return "ObtenerClaveMovilQR" in url or "/MOVI-" in url or "Cl@ve Móvil" in title
 
 
+def _wait_idp_button_or_sso(driver, timeout: float):
+    """On pasarela.clave.gob.es: return the Cl@ve Móvil button once it shows, or None
+    as soon as a warm SSO has carried the browser off the gateway (or on timeout).
+
+    A plain element wait sat out the full timeout (~30 s) on every SSO pass,
+    because the chooser never renders then (12:15:24 -> 12:15:56, 2026-10-13).
+    """
+    def _button_or_left(d):
+        if "pasarela.clave.gob.es" not in (d.current_url or ""):
+            return "left"
+        for idx, (by, value) in enumerate(IDP_MOVIL_BUTTON.strategies):
+            found = d.find_elements(by, value)
+            if found:
+                return idx, by, value, found[0]
+        return False
+
+    try:
+        result = WebDriverWait(driver, timeout, poll_frequency=0.5).until(_button_or_left)
+    except Exception:
+        return None
+    if isinstance(result, str):
+        return None
+    idx, by, value, button = result
+    if idx > 0:
+        _record_fallback(IDP_MOVIL_BUTTON.name, by, value, driver)
+    return button
+
+
 def _alert_clave_needed(reason: str):
     """Push "scan the QR" — immediately the first time, then at most every CLAVE_ALERT_REPEAT_S."""
     global _clave_alert_at
@@ -444,8 +484,8 @@ def _alert_clave_needed(reason: str):
 
 def _mark_good_check():
     """Called when a cycle reaches the real cita result page (Cl@ve worked end to end)."""
-    global _last_good_check, _clave_alert_at, _stale_alert_at, _qr_timeout_pending
-    _last_good_check = time.time()
+    global _last_good_check, _last_real_good_check, _clave_alert_at, _stale_alert_at, _qr_timeout_pending
+    _last_good_check = _last_real_good_check = time.time()
     _qr_timeout_pending = False
     if _clave_alert_at and not _in_quiet_hours():
         _ntfy("Cl@ve login OK", "Cita checks are running again.", priority="default", tags="white_check_mark")
@@ -1774,7 +1814,7 @@ def cycle_cita(
     if "pasarela.clave.gob.es" in cur_url:
         logging.info("[con-Cl@ve 2] On Cl@ve gateway — selecting Cl@ve Móvil (IDP_MOVIL)")
         _clave_event("gateway", driver)
-        idp_btn = find_element_resilient(driver, IDP_MOVIL_BUTTON, timeout=DELAY)
+        idp_btn = _wait_idp_button_or_sso(driver, DELAY)
         if idp_btn:
             _real_click(driver, idp_btn)
 
@@ -1833,20 +1873,30 @@ def cycle_cita(
     # ── Step 4b: Cl@ve Móvil QR page = login expired. Alert, then HOLD the QR on
     # screen so a scan can complete (the old 30s element wait abandoned it). ──
     if _on_clave_qr_page(driver):
-        logging.warning(f"[con-Cl@ve 2b] Cl@ve login expired — on the QR page; holding up to {CLAVE_QR_WAIT_S}s for a scan")
         global _qr_timeout_pending
-        _clave_event("qr_shown", driver, after_timeout=_qr_timeout_pending)
+        good_ago = time.time() - _last_real_good_check
+        # Not hourly while a login-lost alert is out: Neil may be at noVNC to scan.
+        hourly = (not _qr_timeout_pending and not _clave_alert_at
+                  and good_ago < CLAVE_QR_RECENT_GOOD_S)
+        hold_s = CLAVE_QR_SHORT_WAIT_S if hourly else CLAVE_QR_WAIT_S
+        if hourly:
+            logging.info(f"[con-Cl@ve 2b] QR page with a good check {int(good_ago // 60)} min ago — "
+                         f"likely the hourly prompt; holding only {hold_s}s")
+        else:
+            logging.warning(f"[con-Cl@ve 2b] Cl@ve login expired — on the QR page; holding up to {hold_s}s for a scan")
+        _clave_event("qr_shown", driver, after_timeout=_qr_timeout_pending, hourly=hourly)
         if _qr_timeout_pending:
             _alert_clave_needed("Cl@ve login lost (QR again on the retry after a timed-out QR)")
         _qr_start = time.time()
-        deadline = _qr_start + CLAVE_QR_WAIT_S
+        deadline = _qr_start + hold_s
         while time.time() < deadline and _on_clave_qr_page(driver):
-            time.sleep(5)
+            time.sleep(min(5, hold_s))
         if _on_clave_qr_page(driver):
             logging.warning("[con-Cl@ve 2b] no scan within the hold window — retry next cycle")
-            _clave_event("qr_timeout", waited_s=int(time.time() - _qr_start))
+            _clave_event("qr_timeout", waited_s=int(time.time() - _qr_start), hourly=hourly)
             _qr_timeout_pending = True
-            _capture_diagnostics(driver, "clave-qr-timeout", context.save_artifacts)
+            if not hourly:
+                _capture_diagnostics(driver, "clave-qr-timeout", context.save_artifacts)
             return None
         try:
             _ = driver.current_url  # a dropped WebDriver also reads as "left the QR page"
