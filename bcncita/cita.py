@@ -72,6 +72,8 @@ speaker = new_speaker()
 
 # acCitar: how long to re-check a not-yet-recognised page.
 ACCITAR_SETTLE_S = float(os.environ.get("ACCITAR_SETTLE_S", "10"))
+# acValidarEntrada: how long to wait for it after the acEntrada envia().
+ACVALIDAR_SETTLE_S = float(os.environ.get("ACVALIDAR_SETTLE_S", "10"))
 # Possible-offer park (run.py): leave the browser on the page this long, with
 # no driver calls (a WebDriver call would dismiss an open ICP+ confirm dialog
 # under a human booking on noVNC). PAUSE keeps it parked for longer.
@@ -81,6 +83,10 @@ ALERT_DEDUPE_S = float(os.environ.get("ALERT_DEDUPE_S", "600"))
 _OFFER_STATES = (PageState.SLOT_SELECTION_TABLE, PageState.SLOT_SELECTION_5MIN)
 _ACCITAR_KNOWN_STATES = (PageState.RATE_LIMITED, PageState.SESSION_EXPIRED,
                          PageState.NO_APPOINTMENTS, *_OFFER_STATES)
+# Pages that end the wait for acValidarEntrada. NO_APPOINTMENTS is not one: the
+# acEntrada page still on screen reads as it (only the acCitar URL counts).
+_ACVALIDAR_SETTLED_STATES = (PageState.VALIDATION_PAGE, PageState.RATE_LIMITED,
+                             PageState.SESSION_EXPIRED, PageState.ERROR, *_OFFER_STATES)
 # Element ids that only appear when citas are offered (office list, slot table).
 _OFFER_ELEMENT_IDS = ("idSede", "CitaMAP_HORAS")
 _last_alert: Dict[str, float] = {}
@@ -1916,8 +1922,21 @@ def cycle_cita(
     time.sleep(random.uniform(1, 2.5))
 
     # ── Step 6: acValidarEntrada — "Solicitar Cita" (btnEnviar → enviar('solicitud')) ──
-    resp_text = body_text(driver)
-    page_state = detect_page_state(driver, resp_text)
+    # Re-check until acValidarEntrada (or a terminal page) has loaded: a single check
+    # 1-2.5 s after envia() read the not-yet-replaced acEntrada as NO_APPOINTMENTS,
+    # so Solicitar Cita was never clicked (2026-10-13 12:08, 14:06, 14:13).
+    # NO_APPOINTMENTS only ends the wait on the acCitar URL itself; on the
+    # acValidarEntrada URL it is that page (NO_APPOINTMENTS outranks it by text).
+    deadline = time.time() + ACVALIDAR_SETTLE_S
+    while True:
+        resp_text = body_text(driver)
+        page_state = detect_page_state(driver, resp_text)
+        url = driver.current_url or ""
+        if page_state == PageState.NO_APPOINTMENTS and "acValidarEntrada" in url:
+            page_state = PageState.VALIDATION_PAGE
+        if page_state in _ACVALIDAR_SETTLED_STATES or "acCitar" in url or time.time() >= deadline:
+            break
+        time.sleep(1)
     if page_state == PageState.RATE_LIMITED:
         return _handle_rate_limit(driver, context, resp_text, "acvalidar")
     if page_state == PageState.VALIDATION_PAGE:
