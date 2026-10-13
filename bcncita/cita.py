@@ -357,10 +357,14 @@ CLAVE_QR_WAIT_S = int(os.environ.get("CLAVE_QR_WAIT_S", "240"))
 # anniversary minute of the last real scan (clave-events.jsonl 10-09..10-13: no
 # scan after 10-09 20:36, QR every ~60 min, next attempt passes 16/19 times).
 # If a cycle reached acCitar within CLAVE_QR_RECENT_GOOD_S, a first QR is that
-# hourly prompt: hold only CLAVE_QR_SHORT_WAIT_S. A QR on the next attempt
-# still gets the full CLAVE_QR_WAIT_S hold and the alert.
+# hourly prompt: hold only CLAVE_QR_SHORT_WAIT_S. The prompt lasts several
+# minutes whatever the bot does (2026-10-13: first QR 18:50/20:51/21:52, QR
+# again 2-4 min later, silent pass 6-8 min after the first), so every QR within
+# CLAVE_QR_HOURLY_WINDOW_S of the first one also gets the short hold and no
+# alert. A QR still there after the window gets the full hold and the alert.
 CLAVE_QR_SHORT_WAIT_S = int(os.environ.get("CLAVE_QR_SHORT_WAIT_S", "15"))
 CLAVE_QR_RECENT_GOOD_S = int(os.environ.get("CLAVE_QR_RECENT_GOOD_S", "4200"))
+CLAVE_QR_HOURLY_WINDOW_S = int(os.environ.get("CLAVE_QR_HOURLY_WINDOW_S", "720"))
 CLAVE_ALERT_REPEAT_S = int(os.environ.get("CLAVE_ALERT_REPEAT_S", "3600"))
 STALE_ALERT_S = int(os.environ.get("STALE_ALERT_S", "7200"))
 NOVNC_URL = os.environ.get("NOVNC_URL", "http://172.16.10.25:7900")
@@ -384,6 +388,7 @@ _last_qr_left = 0.0  # when the bot last left the QR page (= a scan or silent re
 # 2026-10-09 21:39->21:40 and 22:40->22:42), so only a QR on the attempt AFTER
 # a timeout means the login is really gone.
 _qr_timeout_pending = False
+_hourly_qr_since = 0.0  # start of the current hourly-QR window; 0 = none open
 
 
 def _in_quiet_hours() -> bool:
@@ -485,8 +490,10 @@ def _alert_clave_needed(reason: str):
 def _mark_good_check():
     """Called when a cycle reaches the real cita result page (Cl@ve worked end to end)."""
     global _last_good_check, _last_real_good_check, _clave_alert_at, _stale_alert_at, _qr_timeout_pending
+    global _hourly_qr_since
     _last_good_check = _last_real_good_check = time.time()
     _qr_timeout_pending = False
+    _hourly_qr_since = 0.0
     if _clave_alert_at and not _in_quiet_hours():
         _ntfy("Cl@ve login OK", "Cita checks are running again.", priority="default", tags="white_check_mark")
     _clave_alert_at = 0.0
@@ -1873,11 +1880,18 @@ def cycle_cita(
     # ── Step 4b: Cl@ve Móvil QR page = login expired. Alert, then HOLD the QR on
     # screen so a scan can complete (the old 30s element wait abandoned it). ──
     if _on_clave_qr_page(driver):
-        global _qr_timeout_pending
-        good_ago = time.time() - _last_real_good_check
+        global _qr_timeout_pending, _hourly_qr_since
+        now = time.time()
+        good_ago = now - _last_real_good_check
+        if _hourly_qr_since and now - _hourly_qr_since < CLAVE_QR_HOURLY_WINDOW_S:
+            hourly = True  # still inside the hourly prompt's window
         # Not hourly while a login-lost alert is out: Neil may be at noVNC to scan.
-        hourly = (not _qr_timeout_pending and not _clave_alert_at
-                  and good_ago < CLAVE_QR_RECENT_GOOD_S)
+        elif (not _qr_timeout_pending and not _clave_alert_at
+              and good_ago < CLAVE_QR_RECENT_GOOD_S):
+            hourly = True
+            _hourly_qr_since = now
+        else:
+            hourly = False
         hold_s = CLAVE_QR_SHORT_WAIT_S if hourly else CLAVE_QR_WAIT_S
         if hourly:
             logging.info(f"[con-Cl@ve 2b] QR page with a good check {int(good_ago // 60)} min ago — "
@@ -1885,7 +1899,7 @@ def cycle_cita(
         else:
             logging.warning(f"[con-Cl@ve 2b] Cl@ve login expired — on the QR page; holding up to {hold_s}s for a scan")
         _clave_event("qr_shown", driver, after_timeout=_qr_timeout_pending, hourly=hourly)
-        if _qr_timeout_pending:
+        if _qr_timeout_pending and not hourly:
             _alert_clave_needed("Cl@ve login lost (QR again on the retry after a timed-out QR)")
         _qr_start = time.time()
         deadline = _qr_start + hold_s
@@ -1930,6 +1944,9 @@ def cycle_cita(
     # Reached acEntrada → the Cl@ve SSO worked this cycle; clear any stuck counter
     # (covers the warm-SSO path that skips the gateway block entirely).
     context._clave_stuck_count = 0
+    # ...and the login is alive, so a QR timeout earlier this hour no longer means
+    # "login lost" even if this cycle dies before acCitar (WAF / caducada).
+    _qr_timeout_pending = False
     logging.info("[con-Cl@ve 3] acEntrada — clicking Copiar (autofill NIE + name)")
     _real_click(driver, copiar_btn)  # real click — autofills from the Cl@ve identity
     time.sleep(random.uniform(2.5, 4.5))  # human pause: review the autofilled form
