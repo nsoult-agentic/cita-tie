@@ -381,6 +381,32 @@ def clear_icp_cookies(driver: WebDriver) -> int:
     return cleared
 
 
+def reset_icp_session(driver: WebDriver) -> bool:
+    """Drop ONLY the ICP app session cookie (JSESSIONID, path /icpplustieb).
+
+    After an ICP "error en el sistema", a blank page or "sesión caducada", the
+    server has dropped that session; reloading the portada with the same
+    JSESSIONID lands on "sesión caducada" again. A fresh visit gets a new one.
+    Keeps the F5 trust cookies (TS*, TSPD_*, *_cspm) — wiping those makes the
+    next request look like an untrusted client — and the Cl@ve SSO cookies,
+    which live on other domains. Only works while the browser is on an
+    /icpplustieb page (cookies are scoped to the current document); returns
+    whether a cookie was deleted.
+    """
+    try:
+        if "administracionelectronica" not in (driver.current_url or ""):
+            return False
+        if driver.get_cookie("JSESSIONID") is None:
+            log.debug("reset_icp_session: no JSESSIONID visible on this page")
+            return False
+        driver.delete_cookie("JSESSIONID")
+    except Exception as e:
+        log.warning(f"reset_icp_session failed: {e}")
+        return False
+    log.info("reset_icp_session: dropped ICP JSESSIONID (F5 + Cl@ve cookies kept)")
+    return True
+
+
 # ── Form Submission ─────────────────────────────────────────────────
 
 def submit_form_resilient(driver: WebDriver, js_function: str, fallback_descriptor=None) -> bool:

@@ -42,6 +42,7 @@ from .resilience import (
     detect_page_state,
     submit_form_resilient,
     clear_icp_cookies,
+    reset_icp_session,
     PageState,
     StepError,
     get_fallback_report,
@@ -885,10 +886,15 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
             _cycle_dur = time.time() - _cycle_start
             _rl_count = getattr(context, '_rate_limit_count', 0)
             _fl = getattr(context, 'first_load', True)
+            _label = 'POSSIBLE_OFFER' if LAST_4010_OFFER else _classify_result(result, driver)
+            # Any cycle that did not end cleanly may leave a dropped ICP session
+            # behind; the next initial_page starts a fresh one.
+            if _label not in ("NO_APPOINTMENTS", "SUCCESS", "POSSIBLE_OFFER"):
+                context._icp_session_dirty = True
             # PAI: structured metrics for experiment analysis
             logging.info(
                 f"[METRICS] cycle={i+1} "
-                f"result={'POSSIBLE_OFFER' if LAST_4010_OFFER else _classify_result(result, driver)} "
+                f"result={_label} "
                 f"duration_s={_cycle_dur:.1f} rate_limit_count={_rl_count} first_load={_fl}"
             )
             # Watchdog per cycle too: an expired login holds ~4 min per cycle, so a
@@ -898,10 +904,12 @@ def start_with(driver: webdriver, context: CustomerProfile, cycles: int = CYCLES
             raise
         except TimeoutException:
             logging.error("Timeout exception")
+            context._icp_session_dirty = True
         except Exception as e:
             # Log only the error message, not the full Selenium/Chrome stacktrace
             msg = str(e).split("\n")[0] if str(e) else type(e).__name__
             logging.error(f"Error: {msg}")
+            context._icp_session_dirty = True
             continue
 
         if result:
@@ -1580,6 +1588,14 @@ def initial_page(
     # after its JS challenge. Wiping them every cycle makes each attempt look like
     # a cold, untrusted client — which is exactly what triggers the
     # "requested URL was rejected" block on the FIRST attempt.
+    # After a failure (a failed cycle, or a failed attempt of this function that the
+    # backoff decorator retries: those set first_load) the ICP server has usually
+    # dropped the session, and reusing its JSESSIONID lands on "sesión caducada".
+    # Start a fresh ICP app session, like a fresh browser: only JSESSIONID goes.
+    # After a clean cycle the session is kept, so the warm path skips the Cl@ve gateway.
+    if context.first_load or getattr(context, "_icp_session_dirty", False):
+        reset_icp_session(driver)
+        context._icp_session_dirty = False
     driver.set_page_load_timeout(300 if context.first_load else 50)
     time.sleep(1)
     driver.get(fast_forward_url)
