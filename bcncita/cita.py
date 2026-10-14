@@ -358,13 +358,14 @@ CLAVE_QR_WAIT_S = int(os.environ.get("CLAVE_QR_WAIT_S", "240"))
 # scan after 10-09 20:36, QR every ~60 min, next attempt passes 16/19 times).
 # If a cycle reached acCitar within CLAVE_QR_RECENT_GOOD_S, a first QR is that
 # hourly prompt: hold only CLAVE_QR_SHORT_WAIT_S. The prompt lasts several
-# minutes whatever the bot does (2026-10-13: first QR 18:50/20:51/21:52, QR
-# again 2-4 min later, silent pass 6-8 min after the first), so every QR within
-# CLAVE_QR_HOURLY_WINDOW_S of the first one also gets the short hold and no
-# alert. A QR still there after the window gets the full hold and the alert.
+# minutes whatever the bot does (2026-10-13: silent pass 6-8 min after the first
+# QR; 2026-10-14: 19:03 -> 19:27 and 19:45 -> still QR at 19:59, i.e. 14-24 min,
+# with no scan), so every QR within CLAVE_QR_HOURLY_WINDOW_S of the first one
+# also gets the short hold and no alert. A QR still there after the window gets
+# the full hold and the alert. 12 min paged "re-scan needed" + "login OK" hourly.
 CLAVE_QR_SHORT_WAIT_S = int(os.environ.get("CLAVE_QR_SHORT_WAIT_S", "15"))
 CLAVE_QR_RECENT_GOOD_S = int(os.environ.get("CLAVE_QR_RECENT_GOOD_S", "4200"))
-CLAVE_QR_HOURLY_WINDOW_S = int(os.environ.get("CLAVE_QR_HOURLY_WINDOW_S", "720"))
+CLAVE_QR_HOURLY_WINDOW_S = int(os.environ.get("CLAVE_QR_HOURLY_WINDOW_S", "2400"))
 CLAVE_ALERT_REPEAT_S = int(os.environ.get("CLAVE_ALERT_REPEAT_S", "3600"))
 STALE_ALERT_S = int(os.environ.get("STALE_ALERT_S", "7200"))
 NOVNC_URL = os.environ.get("NOVNC_URL", "http://172.16.10.25:7900")
