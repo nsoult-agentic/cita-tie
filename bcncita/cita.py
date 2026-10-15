@@ -368,11 +368,24 @@ ALERT_QUIET_START = int(os.environ.get("ALERT_QUIET_START", "0"))
 ALERT_QUIET_END = int(os.environ.get("ALERT_QUIET_END", "11"))
 CLAVE_EVENTS_FILE = os.environ.get("CLAVE_EVENTS_FILE", "/app/data/clave-events.jsonl")
 
-_last_good_check = time.time()  # container start counts as the baseline
+# Persisted so a redeploy/restart does not restart the 2 h stale timer.
+LAST_GOOD_FILE = os.environ.get("LAST_GOOD_FILE", "/app/data/last-good-check")
+
+
+def _load_last_good() -> float:
+    try:
+        with open(LAST_GOOD_FILE, encoding="utf-8") as f:
+            return min(float(f.read().strip()), time.time())
+    except Exception:
+        return time.time()  # no record: container start counts as the baseline
+
+
+_last_good_check = _load_last_good()
 _stale_alert_at = 0.0  # 0 = no outstanding stale alert
+_stale_alert_cause = ""  # "clave" / "site" / "paused" for the outstanding alert
 _last_qr_left = 0.0  # when the bot last left the QR page (= a scan or silent re-auth)
-# True while the latest attempt stopped at Cl@ve (QR page or stuck gateway);
-# cleared when a cycle reaches acEntrada. Picks the stale alert's wording.
+# True when the latest attempt stopped at Cl@ve (QR page or stuck gateway);
+# reset at the start of every attempt. Picks the stale alert's wording.
 _clave_blocked = False
 
 
@@ -455,31 +468,45 @@ def _wait_idp_button_or_sso(driver, timeout: float):
 
 def _mark_good_check():
     """Called when a cycle reaches the real cita result page (Cl@ve worked end to end)."""
-    global _last_good_check, _stale_alert_at, _clave_blocked
+    global _last_good_check, _stale_alert_at, _stale_alert_cause, _clave_blocked
     _last_good_check = time.time()
     _clave_blocked = False
+    try:
+        with open(LAST_GOOD_FILE, "w", encoding="utf-8") as f:
+            f.write(str(_last_good_check))
+    except Exception as e:
+        logging.error(f"last-good-check write failed: {e}")
     if _stale_alert_at and not _in_quiet_hours():
         _ntfy("Cita checks working again", "The bot reached the cita page again.",
               priority="default", tags="white_check_mark")
     _stale_alert_at = 0.0
+    _stale_alert_cause = ""
 
 
 def check_stale_and_alert():
-    """Push ONCE if no cycle has reached the cita result page for STALE_ALERT_S."""
-    global _stale_alert_at
+    """Push once if no cycle has reached the cita result page for STALE_ALERT_S.
+
+    One more push only if the cause later turns into Cl@ve (the one cause Neil
+    must act on), e.g. the site was down and then the login lapsed.
+    """
+    global _stale_alert_at, _stale_alert_cause
     idle = time.time() - _last_good_check
-    if idle < STALE_ALERT_S or _stale_alert_at or _in_quiet_hours():
+    if idle < STALE_ALERT_S or _in_quiet_hours():
+        return
+    cause = "paused" if PAUSE.is_set() else ("clave" if _clave_blocked else "site")
+    if _stale_alert_at and (cause != "clave" or _stale_alert_cause == "clave"):
         return
     _stale_alert_at = time.time()
+    _stale_alert_cause = cause
     since = dt.fromtimestamp(_last_good_check).strftime("%d/%m %H:%M")
     head = f"No check has reached the cita page for {idle / 3600:.1f}h (last good: {since}). "
-    if PAUSE.is_set():
+    if cause == "paused":
         _ntfy("No cita checks working",
               head + "The bot is PAUSED via /control/probe?cmd=pause; resume it with cmd=resume.",
               priority="urgent", tags="rotating_light")
-    elif _clave_blocked:
+    elif cause == "clave":
         _ntfy("Cl@ve re-scan needed",
-              head + f"The last attempt that got past the site stopped at the Cl@ve Móvil QR. "
+              head + f"The last attempt stopped at the Cl@ve Móvil QR. "
               f"Open {NOVNC_URL} and scan it; "
               f"the bot now holds the QR on screen {CLAVE_QR_WAIT_S // 60} min each attempt.",
               priority="urgent", tags="lock")
@@ -1754,6 +1781,7 @@ def cycle_cita(
       → acCitar → classify (no citas / offer page → cita_selection).
     """
     global _clave_blocked, _last_qr_left
+    _clave_blocked = False
     # initial_page navigates the portada (sede=99 + tramiteGrupo[0]=4010, envia())
     # and lands on acInfo (PageState.INSTRUCTIONS — has btnEntrar + btnAccesoClave).
     start = initial_page(driver, context, fast_forward_url, fast_forward_url2)
