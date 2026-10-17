@@ -342,22 +342,28 @@ def _ntfy(title, message, priority="default", tags=""):
         # Don't swallow non-2xx — a 403 (missing/expired token) used to look like success.
         if resp.status_code >= 300:
             logging.error(f"ntfy push rejected: HTTP {resp.status_code} {resp.text[:200]}")
+        else:
+            logging.info(f"[NTFY] sent title={title!r} priority={priority}")
+            _clave_event("push_sent", title=title, priority=priority)
     except Exception as e:
         logging.error(f"ntfy send failed: {e}")
 
 
 # PAI: Cl@ve QR handling + "no successful check" watchdog.
 # The Cl@ve Móvil IdP lands on agenciatributaria.gob.es (ObtenerClaveMovilQR).
-# That QR page also comes about once an hour while the login is still good and
-# clears by itself with no scan, after anything from 6 to ~58 min
-# (clave-events.jsonl 10-09..10-15: no scan after 10-09 20:36; 2026-10-15 QR
-# from 16:08 to 17:06). PRs 19/20/22 each guessed that duration and paged when a
-# QR outlasted the guess, so a QR on screen is NOT a login-loss signal. The only
-# push is the outcome: no cycle reached acCitar for STALE_ALERT_S. One push per
-# outage, one when checks work again.
+# That QR page comes about once an hour while the login is still good and clears
+# with no scan. HOW LONG it lasts is set by the bot, not by Cl@ve
+# (clave-events.jsonl 10-09..10-17): with a 240 s hold on every QR it cleared in
+# ~6 min (1 QR visit); each short-hold PR (19/20/22/23: 15 s until a window or the
+# stale alert) stretched it to that window + ~7 min — 20, 47, then ~127 min with
+# 36-61 QR visits — and every stretch ended within one or two 240 s holds of the
+# switch. Re-requesting the QR every ~1.5 min keeps the prompt alive. So the hold
+# is ALWAYS the full CLAVE_QR_WAIT_S. Do not shorten it.
+# The only push is the outcome: no cycle reached acCitar for STALE_ALERT_S.
 CLAVE_QR_WAIT_S = int(os.environ.get("CLAVE_QR_WAIT_S", "240"))
-# Hold on the QR while no alert is out (the prompt clears by itself, not by waiting).
-CLAVE_QR_SHORT_WAIT_S = int(os.environ.get("CLAVE_QR_SHORT_WAIT_S", "15"))
+# A QR stretch longer than this (with full holds) is logged as a WARNING:
+# either the login is really lost or the self-clear behaviour changed.
+CLAVE_QR_STRETCH_WARN_S = int(os.environ.get("CLAVE_QR_STRETCH_WARN_S", "1800"))
 STALE_ALERT_S = int(os.environ.get("STALE_ALERT_S", "7200"))
 NOVNC_URL = os.environ.get("NOVNC_URL", "http://172.16.10.25:7900")
 
@@ -384,6 +390,10 @@ _last_good_check = _load_last_good()
 _stale_alert_at = 0.0  # 0 = no outstanding stale alert
 _stale_alert_cause = ""  # "clave" / "site" / "paused" for the outstanding alert
 _last_qr_left = 0.0  # when the bot last left the QR page (= a scan or silent re-auth)
+# One "QR stretch" = first QR page after a good check up to the next good check.
+_qr_stretch_start = 0.0  # 0 = no QR since the last good check
+_qr_stretch_visits = 0
+_qr_stretch_warned = False
 # True when the latest attempt stopped at Cl@ve (QR page or stuck gateway);
 # reset at the start of every attempt. Picks the stale alert's wording.
 _clave_blocked = False
@@ -469,8 +479,14 @@ def _wait_idp_button_or_sso(driver, timeout: float):
 def _mark_good_check():
     """Called when a cycle reaches the real cita result page (Cl@ve worked end to end)."""
     global _last_good_check, _stale_alert_at, _stale_alert_cause, _clave_blocked
+    global _qr_stretch_start, _qr_stretch_visits, _qr_stretch_warned
     _last_good_check = time.time()
     _clave_blocked = False
+    if _qr_stretch_start:
+        _clave_event("qr_stretch_end",
+                     minutes=round((_last_good_check - _qr_stretch_start) / 60, 1),
+                     qr_visits=_qr_stretch_visits, alert_was_out=bool(_stale_alert_at))
+        _qr_stretch_start, _qr_stretch_visits, _qr_stretch_warned = 0.0, 0, False
     try:
         with open(LAST_GOOD_FILE, "w", encoding="utf-8") as f:
             f.write(str(_last_good_check))
@@ -508,7 +524,7 @@ def check_stale_and_alert():
         _ntfy("Cl@ve re-scan needed",
               head + f"The last attempt stopped at the Cl@ve Móvil QR. "
               f"Open {NOVNC_URL} and scan it; "
-              f"the bot now holds the QR on screen {CLAVE_QR_WAIT_S // 60} min each attempt.",
+              f"the bot holds the QR on screen {CLAVE_QR_WAIT_S // 60} min each attempt.",
               priority="urgent", tags="lock")
     else:
         _ntfy("No cita checks working",
@@ -1780,7 +1796,7 @@ def cycle_cita(
       → [btnCopiar] + set country → [btnEnviar] → acValidarEntrada → [btnEnviar]
       → acCitar → classify (no citas / offer page → cita_selection).
     """
-    global _clave_blocked, _last_qr_left
+    global _clave_blocked, _last_qr_left, _qr_stretch_start, _qr_stretch_visits, _qr_stretch_warned
     _clave_blocked = False
     # initial_page navigates the portada (sede=99 + tramiteGrupo[0]=4010, envia())
     # and lands on acInfo (PageState.INSTRUCTIONS — has btnEntrar + btnAccesoClave).
@@ -1877,11 +1893,27 @@ def cycle_cita(
     # itself; no push from here (check_stale_and_alert owns alerting). ──
     if _on_clave_qr_page(driver):
         _clave_blocked = True
-        # Full hold only after the stale alert went out (Neil may be at noVNC to
-        # scan); otherwise the prompt clears by itself on a later attempt.
-        hold_s = CLAVE_QR_WAIT_S if _stale_alert_at else CLAVE_QR_SHORT_WAIT_S
-        logging.info(f"[con-Cl@ve 2b] on the Cl@ve QR page; holding {hold_s}s")
-        _clave_event("qr_shown", driver, hold_s=hold_s)
+        # ALWAYS the full hold: a short hold re-requests the QR every ~1.5 min and
+        # keeps the prompt alive for hours (see CLAVE_QR_WAIT_S above).
+        hold_s = CLAVE_QR_WAIT_S
+        now = time.time()
+        first_in_stretch = not _qr_stretch_start
+        if first_in_stretch:
+            _qr_stretch_start = now
+        _qr_stretch_visits += 1
+        stretch_s = int(now - _qr_stretch_start)
+        logging.info(f"[con-Cl@ve 2b] on the Cl@ve QR page; holding {hold_s}s "
+                     f"(visit {_qr_stretch_visits}, stretch {stretch_s // 60} min)")
+        _clave_event("qr_shown", driver, hold_s=hold_s,
+                     stretch_visit=_qr_stretch_visits, stretch_s=stretch_s)
+        if first_in_stretch:
+            # One screenshot per hourly prompt: evidence of what the page showed.
+            _capture_diagnostics(driver, "clave-qr-first", context.save_artifacts)
+        if stretch_s > CLAVE_QR_STRETCH_WARN_S and not _qr_stretch_warned:
+            _qr_stretch_warned = True
+            logging.warning(f"[con-Cl@ve 2b] QR prompt has lasted {stretch_s // 60} min with "
+                            f"full holds ({_qr_stretch_visits} visits) — login may be lost")
+            _capture_diagnostics(driver, "clave-qr-long", context.save_artifacts)
         _qr_start = time.time()
         deadline = _qr_start + hold_s
         while time.time() < deadline and _on_clave_qr_page(driver):
