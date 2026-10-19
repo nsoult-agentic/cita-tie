@@ -44,8 +44,8 @@ services:
       # port below (8085), NOT the in-container SMS_CODE_PORT. Reachable from the LAN.
       - SMS_PUBLIC_URL=http://172.16.10.25:8085
       - HOT_CYCLES=12
-      # Scheduled pause (YYYY-MM-DD, local 00:00): no checks and no alerts until
-      # then. Neil is abroad 2026-10-27 -> 2026-12-08 (SWISS ZA46PS lands BCN Dec 8
+      # Scheduled pause (YYYY-MM-DD): no checks and no alerts until
+      # then (ends 11:00 local). Neil is abroad 2026-10-27 -> 2026-12-08 (SWISS ZA46PS lands BCN Dec 8
       # 12:10, brain #4255); resume one week before. Empty = no pause.
       - PAUSE_UNTIL=2026-12-01
       # Step 2: drive the long-lived cita-browser via Remote WebDriver so code

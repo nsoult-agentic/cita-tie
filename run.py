@@ -261,16 +261,18 @@ HOT_SLEEP = int(os.environ.get("HOT_SLEEP", "15"))
 COLD_CYCLES = int(os.environ.get("COLD_CYCLES", "5"))
 COLD_SLEEP = int(os.environ.get("COLD_SLEEP", "180"))
 
-# Scheduled pause: PAUSE_UNTIL=YYYY-MM-DD (container local time, 00:00). Until
-# then no cycle runs, the browser is not touched and NO alert is sent (the stale
-# watchdog is skipped). Set in docker-compose.yml so it survives redeploys and
-# restarts. Empty = no scheduled pause.
+# Scheduled pause: PAUSE_UNTIL=YYYY-MM-DD. It ends that day at ALERT_QUIET_END
+# (container local time, default 11:00) so the resume push never lands in quiet
+# hours. Until then no cycle runs, the browser is not touched and NO alert is
+# sent (the stale watchdog is skipped). Set in docker-compose.yml so it survives
+# redeploys and restarts. Empty = no scheduled pause.
 def _parse_pause_until(raw):
     raw = (raw or "").strip()
     if not raw:
         return None
     try:
-        return datetime.strptime(raw, "%Y-%m-%d")
+        return datetime.strptime(raw, "%Y-%m-%d").replace(
+            hour=int(os.environ.get("ALERT_QUIET_END", "11")))
     except ValueError:
         log.error(f"PAUSE_UNTIL={raw!r} is not YYYY-MM-DD; ignored")
         return None
@@ -522,13 +524,14 @@ def main():
 
     profile, ntfy_config = build_profile()
 
-    _ntfy(
-        "TIE Checker Started",
-        f"Monitoring for {profile.operation_code.name} appointments in {profile.province.name.title()}",
-        ntfy_config,
-        priority="default",
-        tags="mag,robot_face",
-    )
+    if not (PAUSE_UNTIL and datetime.now() < PAUSE_UNTIL):
+        _ntfy(
+            "TIE Checker Started",
+            f"Monitoring for {profile.operation_code.name} appointments in {profile.province.name.title()}",
+            ntfy_config,
+            priority="default",
+            tags="mag,robot_face",
+        )
 
     last_heartbeat = time.time()
     in_scheduled_pause = False
