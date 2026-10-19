@@ -499,6 +499,20 @@ def _mark_good_check():
     _stale_alert_cause = ""
 
 
+def restart_stale_clock():
+    """Start the stale timer now (after a scheduled pause) without a good check."""
+    global _last_good_check, _stale_alert_at, _stale_alert_cause, _clave_blocked
+    global _qr_stretch_start, _qr_stretch_visits, _qr_stretch_warned
+    _last_good_check = time.time()
+    _stale_alert_at, _stale_alert_cause, _clave_blocked = 0.0, "", False
+    _qr_stretch_start, _qr_stretch_visits, _qr_stretch_warned = 0.0, 0, False
+    try:
+        with open(LAST_GOOD_FILE, "w", encoding="utf-8") as f:
+            f.write(str(_last_good_check))
+    except Exception as e:
+        logging.error(f"last-good-check write failed: {e}")
+
+
 def check_stale_and_alert():
     """Push once if no cycle has reached the cita result page for STALE_ALERT_S.
 
