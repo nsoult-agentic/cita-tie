@@ -261,6 +261,23 @@ HOT_SLEEP = int(os.environ.get("HOT_SLEEP", "15"))
 COLD_CYCLES = int(os.environ.get("COLD_CYCLES", "5"))
 COLD_SLEEP = int(os.environ.get("COLD_SLEEP", "180"))
 
+# Scheduled pause: PAUSE_UNTIL=YYYY-MM-DD (container local time, 00:00). Until
+# then no cycle runs, the browser is not touched and NO alert is sent (the stale
+# watchdog is skipped). Set in docker-compose.yml so it survives redeploys and
+# restarts. Empty = no scheduled pause.
+def _parse_pause_until(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        log.error(f"PAUSE_UNTIL={raw!r} is not YYYY-MM-DD; ignored")
+        return None
+
+
+PAUSE_UNTIL = _parse_pause_until(os.environ.get("PAUSE_UNTIL"))
+
 # Office name → enum mapping
 OFFICE_MAP = {name: member for name, member in Office.__members__.items()}
 
@@ -514,13 +531,32 @@ def main():
     )
 
     last_heartbeat = time.time()
+    in_scheduled_pause = False
 
     while True:
+        import bcncita.cita as _cita_mod
+        if PAUSE_UNTIL and datetime.now() < PAUSE_UNTIL:
+            if not in_scheduled_pause:
+                in_scheduled_pause = True
+                log.info(f"Scheduled pause until {PAUSE_UNTIL:%Y-%m-%d} — no checks, no alerts")
+            _stats["last_state"] = f"scheduled pause until {PAUSE_UNTIL:%Y-%m-%d}"
+            time.sleep(max(1, min(3600, (PAUSE_UNTIL - datetime.now()).total_seconds())))
+            continue
+        if in_scheduled_pause:
+            in_scheduled_pause = False
+            # The stale timer starts now, not at the last check before the pause.
+            _cita_mod.restart_stale_clock()
+            log.info("Scheduled pause ended — checks resume")
+            _cita_mod._ntfy(
+                "Cita bot resumed",
+                "The scheduled pause ended and checks have restarted. The Cl@ve login "
+                "may have lapsed during the pause: if no check works for 2 h you get "
+                "one 'Cl@ve re-scan needed' message.",
+                priority="default", tags="arrow_forward")
         # /control/probe?cmd=pause also pauses the 4010 loop (and stops a run's
         # cycles, see PAUSE in bcncita.cita), so a human booking on the shared
         # browser is not navigated away. The stale watchdog keeps running, so a
         # forgotten pause still raises "No cita checks working".
-        import bcncita.cita as _cita_mod
         if _cita_mod.PAUSE.is_set():
             _stats["last_state"] = "paused via /control/probe"
             try:
