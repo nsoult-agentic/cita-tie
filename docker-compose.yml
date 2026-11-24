@@ -79,7 +79,7 @@ services:
     # longer matches any current floating tag. diun (labels below) will NOTIFY on the
     # newer 4.46.0 (and later X.Y.Z) releases — moving forward is then an explicit,
     # reviewable digest bump, never an automatic float.
-    image: selenium/standalone-firefox@sha256:2bb7d9e63088ba6dc7f4d5acd807f27d8410221f881853a97ac3c95f50e8d951
+    image: selenium/standalone-firefox@sha256:db659e9c8e31d2965c28de8756d2bce6f88e738d8c36e971f361857987d07d38
     container_name: cita-browser
     labels:
       # Third-party image: diun WATCHES + NOTIFIES on new releases (it never auto-moves the pin).
